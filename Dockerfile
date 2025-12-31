@@ -1,15 +1,18 @@
-FROM dockur/windows
+# We use ghcr.io (GitHub) instead of Docker Hub to bypass the rate limit error
+FROM ghcr.io/dockur/windows:latest
 
 # --- OS CONFIGURATION ---
 ENV VERSION "tiny11"
-# KVM="N" is CRITICAL for Railway (Non-KVM environment)
 ENV KVM "N"
 
 # --- PERFORMANCE TUNING ---
-# 16GB RAM / 8 Cores
+# 16GB RAM / 8 Cores (Adjusted for your Railway plan)
 ENV RAM_SIZE "16G"
 ENV CPU_CORES "8"
 
+# --- STORAGE ---
+# We removed the VOLUME command because Railway forbids it in Dockerfiles.
+# You MUST add the volume in the Railway Dashboard settings instead.
+
 # --- NETWORKING ---
-# Port 8006 is the web-based viewer
 EXPOSE 8006
