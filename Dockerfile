@@ -1,18 +1,37 @@
-# We use ghcr.io (GitHub) instead of Docker Hub to bypass the rate limit error
-FROM ghcr.io/dockur/windows:latest
+# Use the latest Ubuntu image
+FROM ubuntu:latest
 
-# --- OS CONFIGURATION ---
-ENV VERSION "tiny11"
-ENV KVM "N"
+# Set environment variables
+ENV DEBIAN_FRONTEND=noninteractive
+ENV PORT=8080
 
-# --- PERFORMANCE TUNING ---
-# 16GB RAM / 8 Cores (Adjusted for your Railway plan)
-ENV RAM_SIZE "16G"
-ENV CPU_CORES "8"
+# 1. Update and install essential networking and shell tools
+RUN apt-get update && apt-get install -y \
+    bash \
+    curl \
+    wget \
+    git \
+    net-tools \
+    iputils-ping \
+    socat \
+    nmap \
+    nano \
+    sudo \
+    && rm -rf /var/lib/apt/lists/*
 
-# --- STORAGE ---
-# We removed the VOLUME command because Railway forbids it in Dockerfiles.
-# You MUST add the volume in the Railway Dashboard settings instead.
+# 2. Install ttyd (Web Terminal) to access the shell via browser
+RUN curl -L https://github.com/tsl0922/ttyd/releases/download/1.7.3/ttyd.x86_64 -o /usr/bin/ttyd \
+    && chmod +x /usr/bin/ttyd
 
-# --- NETWORKING ---
-EXPOSE 8006
+# 3. Create a generic user (optional, but safer) or stick to root
+WORKDIR /root
+
+# 4. EXPOSE ALL PORTS
+# Note: This updates the Docker metadata to say all ports are listening.
+# Railway's router will still only forward public HTTP traffic to the $PORT defined below.
+EXPOSE 1-65535
+
+# 5. Start the Web Shell
+# We bind ttyd to the internal $PORT so you can access it via the Railway URL.
+# 'bash' is the shell that will open.
+CMD ttyd -p $PORT -W bash
