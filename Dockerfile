@@ -1,37 +1,52 @@
-# Use the latest Ubuntu image
-FROM ubuntu:latest
+FROM ubuntu:22.04
 
-# Set environment variables
+# 1. Setup Environment
 ENV DEBIAN_FRONTEND=noninteractive
 ENV PORT=8080
 
-# 1. Update and install essential networking and shell tools
+# 2. Install Dependencies (Java for Minecraft, Node for Panel, Tools)
 RUN apt-get update && apt-get install -y \
-    bash \
-    curl \
+    openjdk-17-jre-headless \
+    nodejs \
+    npm \
     wget \
+    curl \
     git \
-    net-tools \
-    iputils-ping \
-    socat \
-    nmap \
+    screen \
     nano \
+    tar \
     sudo \
     && rm -rf /var/lib/apt/lists/*
 
-# 2. Install ttyd (Web Terminal) to access the shell via browser
-RUN curl -L https://github.com/tsl0922/ttyd/releases/download/1.7.3/ttyd.x86_64 -o /usr/bin/ttyd \
-    && chmod +x /usr/bin/ttyd
+# 3. Install MCSManager (The Panel)
+WORKDIR /opt/mcsmanager
+RUN wget https://github.com/MCSManager/MCSManager/releases/latest/download/mcsmanager_linux_release.tar.gz \
+    && tar -zxvf mcsmanager_linux_release.tar.gz \
+    && rm mcsmanager_linux_release.tar.gz
 
-# 3. Create a generic user (optional, but safer) or stick to root
-WORKDIR /root
+# 4. Install Playit.gg (The Tunnel to let players join)
+RUN curl -SSL https://playit-cloud.github.io/ppa/key.gpg | gpg --dearmor | tee /etc/apt/trusted.gpg.d/playit.gpg >/dev/null \
+    && echo "deb [signed-by=/etc/apt/trusted.gpg.d/playit.gpg] https://playit-cloud.github.io/ppa/data ./" | tee /etc/apt/sources.list.d/playit.list \
+    && apt-get update && apt-get install -y playit
 
-# 4. EXPOSE ALL PORTS
-# Note: This updates the Docker metadata to say all ports are listening.
-# Railway's router will still only forward public HTTP traffic to the $PORT defined below.
-EXPOSE 1-65535
+# 5. Create Startup Script
+# This runs the Panel on Railway's port, and the Tunnel in the background
+RUN echo '#!/bin/bash\n\
+echo "Starting Playit.gg Tunnel..."\n\
+# Start playit in background. You must claim the agent via the link in logs!\n\
+playit &\n\
+\n\
+echo "Starting MCSManager..."\n\
+# Configure MCSManager to listen on the PORT variable provided by Railway\n\
+cd /opt/mcsmanager/web\n\
+sed -i "s/23333/$PORT/g" data/SystemConfig/config.json\n\
+\n\
+# Start Daemon (controls the server) and Web (the UI)\n\
+cd /opt/mcsmanager/daemon\n\
+node app.js &\n\
+cd /opt/mcsmanager/web\n\
+node app.js\n\
+' > /start.sh && chmod +x /start.sh
 
-# 5. Start the Web Shell
-# We bind ttyd to the internal $PORT so you can access it via the Railway URL.
-# 'bash' is the shell that will open.
-CMD ttyd -p $PORT -W bash
+# 6. Start
+CMD ["/start.sh"]
