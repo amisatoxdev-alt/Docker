@@ -4,7 +4,7 @@ FROM ubuntu:22.04
 ENV DEBIAN_FRONTEND=noninteractive
 ENV PORT=8080 
 
-# 2. Install Basic Tools (curl needed for node setup)
+# 2. Install Dependencies (Node 18 Fixed)
 RUN apt-get update && apt-get install -y \
     curl \
     wget \
@@ -16,35 +16,32 @@ RUN apt-get update && apt-get install -y \
     gnupg \
     && rm -rf /var/lib/apt/lists/*
 
-# 3. Install Node.js v18 (REQUIRED for MCSManager to fix 'node:crypto' error)
+# Install Node.js 18 (Prevents the crash you saw earlier)
 RUN curl -fsSL https://deb.nodesource.com/setup_18.x | bash - \
     && apt-get install -y nodejs
 
-# 4. Install Java 17 (For Minecraft)
-RUN apt-get update && apt-get install -y openjdk-17-jre-headless \
-    && rm -rf /var/lib/apt/lists/*
+# Install Java 17
+RUN apt-get install -y openjdk-17-jre-headless
 
-# 5. Install MCSManager
+# 3. Install Playit.gg (The Tunnel)
+RUN curl -ssL https://playit-cloud.github.io/ppa/key.gpg | gpg --dearmor | tee /etc/apt/trusted.gpg.d/playit.gpg >/dev/null \
+    && echo "deb [signed-by=/etc/apt/trusted.gpg.d/playit.gpg] https://playit-cloud.github.io/ppa/data ./" | tee /etc/apt/sources.list.d/playit.list \
+    && apt-get update && apt-get install -y playit
+
+# 4. Install MCSManager
 WORKDIR /opt/mcsmanager
 RUN wget https://github.com/MCSManager/MCSManager/releases/latest/download/mcsmanager_linux_release.tar.gz \
     && tar -zxvf mcsmanager_linux_release.tar.gz \
     && rm mcsmanager_linux_release.tar.gz \
-    # Fix folder structure: move files from sub-folder to root if they exist
+    # Fix folder structure
     && if [ -d "mcsmanager" ]; then cp -r mcsmanager/* .; rm -rf mcsmanager; fi
 
-# 6. Expose Ports
-EXPOSE 25565 24444
-
-# 7. Startup Script
+# 5. Startup Script
+# We start Playit in the background, then the Panel
 RUN echo '#!/bin/bash\n\
-\n\
-# Ensure config file exists before modification\n\
-if [ -f "/opt/mcsmanager/web/data/SystemConfig/config.json" ]; then\n\
-  echo "Configuring existing config.json..."\n\
-  sed -i "s/\"port\": 23333/\"port\": $PORT/g" /opt/mcsmanager/web/data/SystemConfig/config.json\n\
-else\n\
-  echo "Warning: Config not found yet. It might generate on first run. Using default ports first."\n\
-fi\n\
+echo "Starting Playit..."\n\
+# Playit will print the Claim URL to the logs\n\
+playit &\n\
 \n\
 echo "Starting MCSManager Daemon..."\n\
 cd /opt/mcsmanager/daemon\n\
@@ -52,7 +49,7 @@ node app.js &\n\
 \n\
 echo "Starting MCSManager Web..."\n\
 cd /opt/mcsmanager/web\n\
-# Force listening on the PORT variable by passing it as argument if supported, or relying on config\n\
+# We bind to 0.0.0.0 so Playit can find it\n\
 node app.js\n\
 ' > /start.sh && chmod +x /start.sh
 
