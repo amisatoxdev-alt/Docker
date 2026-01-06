@@ -5,7 +5,7 @@ ENV DEBIAN_FRONTEND=noninteractive
 ENV PORT=8080
 
 # --- 2. INSTALL DEPENDENCIES ---
-# Java 21 (Latest MC), Node.js, Curl, Wget, Zip
+# Java 21 (Latest), Node.js, Unzip
 RUN apt-get update && apt-get install -y \
     curl wget git tar sudo unzip zip \
     openjdk-21-jre-headless \
@@ -15,19 +15,19 @@ RUN apt-get update && apt-get install -y \
 RUN curl -fsSL https://deb.nodesource.com/setup_20.x | bash - \
     && apt-get install -y nodejs
 
-# --- 3. SETUP APP DIRECTORY ---
+# --- 3. SETUP APP ---
 WORKDIR /app
-
-# Initialize & Install Modules
 RUN npm init -y && \
     npm install express socket.io multer fs-extra body-parser express-session adm-zip axios
 
-# Default Config & EULA
+# Default Settings
 RUN echo "eula=true" > eula.txt
-# Create a config file for RAM and JAR settings
-RUN echo '{"ram": "2G", "jar": "server.jar"}' > settings.json
+RUN echo '{"ram": "1G", "jar": "server.jar"}' > settings.json
 
-# --- 4. BACKEND CODE (server.js) ---
+# *** FORCE GAME PORT TO 25565 ***
+RUN echo "server-port=25565" > server.properties
+
+# --- 4. BACKEND (server.js) ---
 RUN cat << 'EOF' > server.js
 const express = require('express');
 const http = require('http');
@@ -46,18 +46,15 @@ const server = http.createServer(app);
 const io = new Server(server);
 const upload = multer({ dest: 'temp_uploads/' });
 
-// --- STATE ---
 const SETTINGS_FILE = 'settings.json';
 const USERS_FILE = 'users.json';
 let mcProcess = null;
 let consoleLog = [];
 
-// --- MIDDLEWARE ---
 app.use(express.static('public'));
 app.use(bodyParser.json());
-app.use(session({ secret: 'supersecret', resave: false, saveUninitialized: true }));
+app.use(session({ secret: 'railway-secret', resave: false, saveUninitialized: true }));
 
-// --- HELPERS ---
 function getSettings() {
     if (!fs.existsSync(SETTINGS_FILE)) fs.writeJsonSync(SETTINGS_FILE, { ram: "1G", jar: "server.jar" });
     return fs.readJsonSync(SETTINGS_FILE);
@@ -75,13 +72,12 @@ function checkAuth(req, res, next) {
 
 // --- ROUTES ---
 
-// 1. Auth (Login/Signup)
+// Auth
 app.post('/api/auth', (req, res) => {
     const { username, password } = req.body;
     let users = {};
     if (fs.existsSync(USERS_FILE)) users = fs.readJsonSync(USERS_FILE, { throws: false }) || {};
     
-    // First time signup
     if (Object.keys(users).length === 0) {
         users[username] = password;
         fs.writeJsonSync(USERS_FILE, users);
@@ -101,7 +97,7 @@ app.get('/api/check-setup', (req, res) => {
     res.json({ setupNeeded: Object.keys(users).length === 0 });
 });
 
-// 2. Server Control
+// Server Control
 app.post('/api/start', checkAuth, (req, res) => {
     if (mcProcess) return res.json({ msg: 'Server already running' });
     
@@ -109,10 +105,11 @@ app.post('/api/start', checkAuth, (req, res) => {
     const ram = settings.ram || "1G";
     const jar = settings.jar || "server.jar";
     
-    if (!fs.existsSync(jar)) return res.json({ msg: 'Server JAR not found! Go to Settings to install one.' });
+    if (!fs.existsSync(jar)) return res.json({ msg: `File '${jar}' not found! Go to Settings and install it.` });
 
-    io.emit('log', `\n>>> STARTING SERVER (${ram} RAM, ${jar})...\n`);
+    io.emit('log', `\n>>> STARTING SERVER (RAM: ${ram}, JAR: ${jar})...\n`);
     
+    // We pass RAM directly to Java
     mcProcess = spawn('java', [`-Xmx${ram}`, `-Xms${ram}`, '-jar', jar, 'nogui']);
     
     mcProcess.stdout.on('data', d => {
@@ -148,16 +145,16 @@ app.post('/api/stop', checkAuth, (req, res) => {
     }
 });
 
-// 3. Settings (RAM & Version)
+// Settings
 app.get('/api/settings', checkAuth, (req, res) => res.json(getSettings()));
 app.post('/api/settings', checkAuth, (req, res) => {
     saveSettings(req.body);
     res.json({ success: true });
 });
 
-// 4. Installer (Version & Plugins)
+// Installer
 app.post('/api/install', checkAuth, async (req, res) => {
-    const { url, type, filename } = req.body; // type = 'jar' or 'plugin'
+    const { url, type, filename } = req.body;
     const targetDir = type === 'plugin' ? 'plugins' : '.';
     fs.ensureDirSync(targetDir);
     const targetPath = path.join(targetDir, filename);
@@ -174,12 +171,12 @@ app.post('/api/install', checkAuth, async (req, res) => {
             res.json({ success: true });
         });
     } catch (err) {
-        io.emit('log', `>>> ERROR DOWNLOADING: ${err.message}\n`);
+        io.emit('log', `>>> ERROR: ${err.message}\n`);
         res.json({ success: false, msg: err.message });
     }
 });
 
-// 5. File Manager
+// Files
 app.get('/api/files', checkAuth, (req, res) => {
     const dir = req.query.path || '.';
     if(dir.includes('..')) return res.json([]); 
@@ -194,17 +191,17 @@ app.post('/api/upload', checkAuth, upload.single('file'), (req, res) => {
         if (req.file.originalname.endsWith('.zip')) {
             try {
                 const zip = new AdmZip(req.file.path);
-                zip.extractAllTo('.', true); // Extract to root
+                zip.extractAllTo('.', true);
             } catch(e) { console.error(e); }
         } else {
             fs.moveSync(req.file.path, path.join('.', req.file.originalname), { overwrite: true });
         }
-        fs.removeSync(req.file.path); // Cleanup temp
+        fs.removeSync(req.file.path);
     }
     res.redirect('/');
 });
 
-// --- SOCKET IO ---
+// Socket
 io.on('connection', (socket) => {
     socket.emit('history', consoleLog.join(''));
     socket.emit('status', mcProcess ? 'running' : 'stopped');
@@ -217,137 +214,122 @@ const port = process.env.PORT || 8080;
 server.listen(port, () => console.log(`PANEL RUNNING ON ${port}`));
 EOF
 
-# --- 5. FRONTEND FILES (HTML/CSS/JS) ---
+# --- 5. FRONTEND ---
 RUN mkdir public
 
-# --- INDEX.HTML (THE UI) ---
+# LOGIN HTML
+RUN cat << 'EOF' > public/login.html
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Login</title>
+    <style>
+        body{background:#111;color:#eee;font-family:sans-serif;display:flex;justify-content:center;align-items:center;height:100vh;margin:0}
+        .box{background:#222;padding:30px;border-radius:10px;width:300px;text-align:center}
+        input{display:block;margin:15px 0;padding:12px;width:100%;box-sizing:border-box;background:#333;border:1px solid #444;color:white;border-radius:5px}
+        button{width:100%;padding:12px;background:#6200ea;color:white;border:none;border-radius:5px;cursor:pointer;font-weight:bold}
+    </style>
+</head>
+<body>
+<div class="box">
+    <h2 id="title">Login</h2>
+    <input type="text" id="user" placeholder="Username">
+    <input type="password" id="pass" placeholder="Password">
+    <button onclick="login()">Enter</button>
+</div>
+<script>
+    fetch('/api/check-setup').then(r=>r.json()).then(d => {
+        if(d.setupNeeded) document.getElementById('title').innerText = 'Create Admin';
+    });
+    async function login() {
+        const u = document.getElementById('user').value;
+        const p = document.getElementById('pass').value;
+        const res = await fetch('/api/auth', { 
+            method:'POST', headers:{'Content-Type':'application/json'}, 
+            body: JSON.stringify({username:u, password:p}) 
+        });
+        const data = await res.json();
+        if(data.success) location.href = '/';
+        else alert(data.msg);
+    }
+</script>
+</body>
+</html>
+EOF
+
+# DASHBOARD HTML
 RUN cat << 'EOF' > public/index.html
 <!DOCTYPE html>
 <html lang="en">
 <head>
     <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Railway MC Panel</title>
+    <title>DIY MC Panel</title>
     <link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0/css/all.min.css" rel="stylesheet">
     <style>
-        :root { --bg: #121212; --panel: #1e1e1e; --accent: #6200ea; --text: #e0e0e0; --red: #cf6679; --green: #03dac6; }
-        body { margin: 0; font-family: 'Segoe UI', sans-serif; background: var(--bg); color: var(--text); display: flex; height: 100vh; overflow: hidden; }
-        
-        /* Sidebar */
-        .sidebar { width: 250px; background: var(--panel); display: flex; flex-direction: column; padding: 20px; box-shadow: 2px 0 10px rgba(0,0,0,0.5); }
-        .sidebar h2 { margin: 0 0 20px 0; color: var(--accent); letter-spacing: 1px; }
-        .nav-btn { background: transparent; border: none; color: #888; padding: 15px; text-align: left; cursor: pointer; font-size: 16px; border-radius: 8px; transition: 0.2s; display: flex; align-items: center; gap: 10px; }
-        .nav-btn:hover, .nav-btn.active { background: #333; color: white; }
-        .nav-btn i { width: 20px; }
-        
-        /* Main Content */
+        :root { --bg: #121212; --panel: #1e1e1e; --accent: #6200ea; --text: #e0e0e0; }
+        body { margin: 0; font-family: sans-serif; background: var(--bg); color: var(--text); display: flex; height: 100vh; overflow: hidden; }
+        .sidebar { width: 250px; background: var(--panel); padding: 20px; display: flex; flex-direction: column; gap: 10px; }
         .main { flex: 1; padding: 20px; display: flex; flex-direction: column; gap: 20px; overflow-y: auto; }
         .card { background: var(--panel); padding: 20px; border-radius: 12px; border: 1px solid #333; }
-        h3 { margin-top: 0; border-bottom: 1px solid #333; padding-bottom: 10px; }
-
-        /* Terminal */
-        #terminal { background: #000; height: 400px; overflow-y: auto; padding: 15px; font-family: monospace; white-space: pre-wrap; font-size: 13px; color: #ccc; border-radius: 8px; border: 1px solid #333; }
-        .input-group { display: flex; gap: 10px; margin-top: 10px; }
-        input[type="text"], select { flex: 1; padding: 12px; border-radius: 6px; border: 1px solid #444; background: #222; color: white; outline: none; }
         
-        /* Buttons */
-        .btn { padding: 10px 20px; border: none; border-radius: 6px; cursor: pointer; font-weight: bold; transition: 0.2s; }
-        .btn-primary { background: var(--accent); color: white; }
-        .btn-success { background: var(--green); color: black; }
-        .btn-danger { background: var(--red); color: black; }
-        .btn:hover { opacity: 0.9; transform: translateY(-1px); }
-        .status-badge { padding: 5px 10px; border-radius: 4px; font-size: 12px; font-weight: bold; text-transform: uppercase; }
-        .status-running { background: rgba(3, 218, 198, 0.2); color: var(--green); }
-        .status-stopped { background: rgba(207, 102, 121, 0.2); color: var(--red); }
-
-        /* File List */
-        .file-item { display: flex; justify-content: space-between; padding: 10px; border-bottom: 1px solid #333; cursor: pointer; }
-        .file-item:hover { background: #2a2a2a; }
-
-        /* Sections */
+        button { padding: 10px; background: #333; color: white; border: none; border-radius: 6px; cursor: pointer; text-align: left; }
+        button:hover { background: #444; }
+        .btn-action { text-align: center; background: var(--accent); font-weight: bold; }
+        .btn-red { background: #cf6679; color: black; text-align: center; }
+        
+        #terminal { background: #000; height: 400px; overflow-y: auto; padding: 15px; font-family: monospace; white-space: pre-wrap; font-size: 13px; border-radius: 8px; border: 1px solid #333; }
+        input { padding: 10px; background: #222; border: 1px solid #444; color: white; border-radius: 6px; width: 100%; box-sizing: border-box; }
+        
         .section { display: none; }
         .section.active { display: block; }
-        
-        /* Login Overlay */
-        #login-overlay { position: fixed; top:0; left:0; width:100%; height:100%; background: var(--bg); z-index: 999; display: flex; justify-content: center; align-items: center; }
-        .login-box { background: var(--panel); padding: 40px; border-radius: 12px; width: 300px; text-align: center; }
+        .nav-active { background: var(--accent); }
     </style>
 </head>
 <body>
 
-<div id="login-overlay">
-    <div class="login-box">
-        <h2 id="login-title">Admin Login</h2>
-        <input type="text" id="username" placeholder="Username" style="margin-bottom: 10px;">
-        <input type="password" id="password" placeholder="Password" style="margin-bottom: 20px;">
-        <button class="btn btn-primary" style="width:100%" onclick="login()">Enter Panel</button>
-    </div>
-</div>
-
 <div class="sidebar">
-    <h2><i class="fa-solid fa-cube"></i> MC PANEL</h2>
-    <button class="nav-btn active" onclick="show('console')"><i class="fa-solid fa-terminal"></i> Console</button>
-    <button class="nav-btn" onclick="show('controls')"><i class="fa-solid fa-gamepad"></i> Game Controls</button>
-    <button class="nav-btn" onclick="show('files')"><i class="fa-solid fa-folder"></i> File Manager</button>
-    <button class="nav-btn" onclick="show('settings')"><i class="fa-solid fa-gear"></i> Settings</button>
+    <h2 style="margin-top:0"><i class="fa-solid fa-server"></i> PANEL v3</h2>
+    <button onclick="show('console')" class="nav-btn nav-active" id="btn-console">Console</button>
+    <button onclick="show('files')" class="nav-btn" id="btn-files">File Manager</button>
+    <button onclick="show('settings')" class="nav-btn" id="btn-settings">Settings (RAM/Ver)</button>
+    <div style="flex:1"></div>
+    <button onclick="api('start')" class="btn-action">START SERVER</button>
+    <button onclick="api('stop')" class="btn-red">STOP SERVER</button>
 </div>
 
 <div class="main">
     
     <div id="console" class="section active">
         <div class="card">
-            <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:10px;">
-                <h3>Server Console</h3>
-                <span id="status-badge" class="status-badge status-stopped">STOPPED</span>
-            </div>
+            <h3 style="margin-top:0">Terminal <span id="status" style="float:right; font-size:12px">...</span></h3>
             <div id="terminal"></div>
-            <div class="input-group">
-                <input type="text" id="cmdInput" placeholder="Type command (e.g., op player, gamemode creative)...">
-                <button class="btn btn-primary" onclick="sendCmd()">Send</button>
-            </div>
-            <div style="margin-top: 15px; display:flex; gap: 10px;">
-                <button class="btn btn-success" onclick="api('start')"><i class="fa-solid fa-play"></i> START</button>
-                <button class="btn btn-danger" onclick="api('stop')"><i class="fa-solid fa-stop"></i> STOP</button>
+            <div style="display:flex; gap:10px; margin-top:10px">
+                <input id="cmdInput" placeholder="Type command...">
+                <button onclick="sendCmd()" class="btn-action" style="width:100px">Send</button>
             </div>
         </div>
-    </div>
-
-    <div id="controls" class="section">
-        <div class="card">
-            <h3>Quick Actions</h3>
-            <div style="display:grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 10px;">
-                <button class="btn btn-primary" onclick="send('time set day')">Time Day</button>
-                <button class="btn btn-primary" onclick="send('time set night')">Time Night</button>
-                <button class="btn btn-primary" onclick="send('weather clear')">Clear Weather</button>
-                <button class="btn btn-primary" onclick="send('gamerule keepInventory true')">Keep Inventory</button>
-            </div>
-        </div>
-        <div class="card" style="margin-top:20px;">
-            <h3>Player Management</h3>
-            <div class="input-group">
-                <input type="text" id="targetPlayer" placeholder="Player Name">
-            </div>
-            <div style="margin-top:10px; display:flex; gap:10px;">
-                <button class="btn btn-success" onclick="playerAction('op')">OP</button>
-                <button class="btn btn-danger" onclick="playerAction('ban')">BAN</button>
-                <button class="btn btn-danger" onclick="playerAction('kick')">KICK</button>
-                <button class="btn btn-primary" onclick="playerAction('gamemode creative')">CREATIVE</button>
-                <button class="btn btn-primary" onclick="playerAction('gamemode survival')">SURVIVAL</button>
-            </div>
+        <div class="card" style="margin-top:20px">
+             <h3>Quick Controls</h3>
+             <div style="display:grid; grid-template-columns: repeat(4, 1fr); gap:10px">
+                 <button class="btn-action" onclick="send('gamemode creative @a')">GM Creative</button>
+                 <button class="btn-action" onclick="send('gamemode survival @a')">GM Survival</button>
+                 <button class="btn-action" onclick="send('time set day')">Time Day</button>
+                 <button class="btn-action" onclick="send('save-all')">Save World</button>
+             </div>
         </div>
     </div>
 
     <div id="files" class="section">
         <div class="card">
-            <h3>Upload Map / Plugins</h3>
-            <form action="/api/upload" method="post" enctype="multipart/form-data" class="input-group">
+            <h3>Upload</h3>
+            <form action="/api/upload" method="post" enctype="multipart/form-data" style="display:flex; gap:10px">
                 <input type="file" name="file" required>
-                <button class="btn btn-success">Upload</button>
+                <button class="btn-action" style="width:150px">Upload</button>
             </form>
-            <small>Supports .zip (auto-extracts) and .jar</small>
+            <p style="font-size:12px; color:#aaa">Upload .zip files to auto-extract them.</p>
         </div>
-        <div class="card" style="margin-top:20px;">
-            <h3>File Browser</h3>
+        <div class="card" style="margin-top:20px">
+            <h3>Files</h3>
             <div id="file-list"></div>
         </div>
     </div>
@@ -355,33 +337,23 @@ RUN cat << 'EOF' > public/index.html
     <div id="settings" class="section">
         <div class="card">
             <h3>Server Configuration</h3>
-            <label>Max RAM Allocation</label>
-            <div class="input-group">
-                <select id="ramSelect">
-                    <option value="1G">1 GB</option>
-                    <option value="2G">2 GB</option>
-                    <option value="4G">4 GB</option>
-                    <option value="8G">8 GB</option>
-                </select>
-                <button class="btn btn-primary" onclick="saveSettings()">Save RAM</button>
-            </div>
+            <p><strong>Custom RAM:</strong> Type amount (e.g. <code>512M</code>, <code>2G</code>, <code>4G</code>, <code>6.5G</code>)</p>
+            <input type="text" id="ramInput" placeholder="e.g. 2G">
+            
+            <p><strong>Target JAR File:</strong> (Which file to run)</p>
+            <input type="text" id="jarInput" placeholder="server.jar">
+            
+            <button onclick="saveSettings()" class="btn-action" style="margin-top:15px; width:100%">SAVE SETTINGS</button>
         </div>
 
-        <div class="card" style="margin-top:20px;">
-            <h3>Version Installer</h3>
-            <p>Click to install a new server version (Will overwrite server.jar!).</p>
-            <div style="display:flex; gap:10px; flex-wrap:wrap;">
-                <button class="btn btn-primary" onclick="install('jar', 'https://api.papermc.io/v2/projects/paper/versions/1.20.4/builds/496/downloads/paper-1.20.4-496.jar', 'server.jar')">Install 1.20.4</button>
-                <button class="btn btn-primary" onclick="install('jar', 'https://api.papermc.io/v2/projects/paper/versions/1.21/builds/130/downloads/paper-1.21-130.jar', 'server.jar')">Install 1.21</button>
-            </div>
-        </div>
-
-        <div class="card" style="margin-top:20px;">
-            <h3>Plugin Installer</h3>
-            <div class="input-group">
-                <input type="text" id="pluginUrl" placeholder="Direct Download URL (must end in .jar)">
-                <input type="text" id="pluginName" placeholder="Filename (e.g. Essentials.jar)">
-                <button class="btn btn-success" onclick="installPlugin()">Install</button>
+        <div class="card" style="margin-top:20px">
+            <h3>Custom Version Installer</h3>
+            <p>Paste a download link to a Server JAR or Plugin.</p>
+            <input type="text" id="installUrl" placeholder="https://..." style="margin-bottom:10px">
+            <input type="text" id="installName" placeholder="Filename (e.g. server.jar)" style="margin-bottom:10px">
+            <div style="display:flex; gap:10px">
+                <button onclick="install('jar')" class="btn-action" style="flex:1">Install as Server JAR</button>
+                <button onclick="install('plugin')" class="btn-action" style="flex:1">Install as Plugin</button>
             </div>
         </div>
     </div>
@@ -393,91 +365,61 @@ RUN cat << 'EOF' > public/index.html
     const socket = io();
     const term = document.getElementById('terminal');
     
-    // --- LOGIN ---
-    fetch('/api/check-setup').then(r=>r.json()).then(d => {
-        if(d.setupNeeded) document.getElementById('login-title').innerText = 'Create Admin Account';
-    });
-
-    async function login() {
-        const u = document.getElementById('username').value;
-        const p = document.getElementById('password').value;
-        const res = await fetch('/api/auth', { 
-            method:'POST', headers:{'Content-Type':'application/json'}, 
-            body: JSON.stringify({username:u, password:p}) 
-        });
-        const data = await res.json();
-        if(data.success) {
-            document.getElementById('login-overlay').style.display = 'none';
-            loadFiles();
-            loadSettings();
-        } else alert(data.msg);
-    }
-
-    // --- NAVIGATION ---
+    // UI Logic
     function show(id) {
         document.querySelectorAll('.section').forEach(el => el.classList.remove('active'));
         document.getElementById(id).classList.add('active');
-        document.querySelectorAll('.nav-btn').forEach(el => el.classList.remove('active'));
-        event.currentTarget.classList.add('active');
+        document.querySelectorAll('.nav-btn').forEach(el => el.classList.remove('nav-active'));
+        document.getElementById('btn-'+id).classList.add('nav-active');
     }
 
-    // --- TERMINAL & SOCKET ---
+    // Terminal
     socket.on('log', msg => {
-        const div = document.createElement('div'); div.textContent = msg;
-        term.appendChild(div);
+        const d = document.createElement('div'); d.innerText = msg; term.appendChild(d);
         term.scrollTop = term.scrollHeight;
     });
-    socket.on('status', s => {
-        const b = document.getElementById('status-badge');
-        b.className = 'status-badge status-' + s;
-        b.innerText = s.toUpperCase();
-    });
+    socket.on('status', s => document.getElementById('status').innerText = s.toUpperCase());
 
     function sendCmd() {
         const i = document.getElementById('cmdInput');
-        if(i.value) { socket.emit('command', i.value); i.value = ''; }
+        if(i.value) { socket.emit('command', i.value); i.value=''; }
     }
-    // Allow Enter key
+    function send(c) { socket.emit('command', c); }
     document.getElementById('cmdInput').addEventListener('keypress', e => { if(e.key === 'Enter') sendCmd(); });
 
-    // --- CONTROLS ---
-    function api(action) { fetch('/api/' + action, { method: 'POST' }); }
-    function send(cmd) { socket.emit('command', cmd); }
-    function playerAction(act) {
-        const p = document.getElementById('targetPlayer').value;
-        if(p) send(act + ' ' + p); else alert('Enter player name');
-    }
-
-    // --- SETTINGS & INSTALLER ---
+    // API
+    function api(act) { fetch('/api/'+act, { method:'POST' }); }
+    
     async function loadSettings() {
         const res = await fetch('/api/settings');
         const data = await res.json();
-        if(data.ram) document.getElementById('ramSelect').value = data.ram;
+        document.getElementById('ramInput').value = data.ram;
+        document.getElementById('jarInput').value = data.jar;
     }
+    
     async function saveSettings() {
-        const ram = document.getElementById('ramSelect').value;
+        const ram = document.getElementById('ramInput').value;
+        const jar = document.getElementById('jarInput').value;
         await fetch('/api/settings', {
             method:'POST', headers:{'Content-Type':'application/json'},
-            body: JSON.stringify({ram})
+            body: JSON.stringify({ram, jar})
         });
         alert('Saved! Restart server to apply.');
     }
-    async function install(type, url, filename) {
-        if(!confirm('This will download file and might overwrite existing ones. Continue?')) return;
-        alert('Download started in background. Check Console.');
+    
+    async function install(type) {
+        const url = document.getElementById('installUrl').value;
+        const filename = document.getElementById('installName').value;
+        if(!url || !filename) return alert('Fill fields');
+        if(!confirm('Download ' + filename + '?')) return;
+        
+        show('console');
         fetch('/api/install', {
             method:'POST', headers:{'Content-Type':'application/json'},
             body: JSON.stringify({type, url, filename})
         });
-        show('console');
-    }
-    function installPlugin() {
-        const url = document.getElementById('pluginUrl').value;
-        const name = document.getElementById('pluginName').value;
-        if(url && name) install('plugin', url, name);
     }
 
-    // --- FILES ---
     async function loadFiles() {
         const res = await fetch('/api/files');
         const files = await res.json();
@@ -485,16 +427,20 @@ RUN cat << 'EOF' > public/index.html
         list.innerHTML = '';
         files.forEach(f => {
             const d = document.createElement('div');
-            d.className = 'file-item';
-            d.innerHTML = `<span>${f.isDir ? '📁' : '📄'} ${f.name}</span>`;
+            d.style.padding = '10px';
+            d.style.borderBottom = '1px solid #333';
+            d.innerText = (f.isDir ? '📁 ' : '📄 ') + f.name;
             list.appendChild(d);
         });
     }
+
+    loadSettings();
+    loadFiles();
 </script>
 </body>
 </html>
 EOF
 
-# --- 6. START COMMAND ---
+# --- 6. START ---
 EXPOSE 8080 25565
 CMD ["node", "server.js"]
