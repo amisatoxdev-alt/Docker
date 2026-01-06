@@ -2,11 +2,9 @@ FROM ubuntu:22.04
 
 # --- 1. SETUP ENVIRONMENT ---
 ENV DEBIAN_FRONTEND=noninteractive
-# Railway assigns a random port to this variable
 ENV PORT=8080
 
 # --- 2. INSTALL DEPENDENCIES ---
-# Nginx (Traffic Cop), Java 21 (Minecraft), Node.js (Panel), Zip Tools
 RUN apt-get update && apt-get install -y \
     curl wget git tar sudo unzip zip \
     nginx gettext-base \
@@ -25,11 +23,9 @@ RUN npm init -y && \
 # Default Configs
 RUN echo "eula=true" > eula.txt
 RUN echo '{"ram": "1G", "jar": "server.jar"}' > settings.json
-# *** CRITICAL: Force Minecraft to 25565 to prevent crashes ***
 RUN echo "server-port=25565" > server.properties
 
 # --- 4. NGINX CONFIGURATION ---
-# Proxies Public Traffic -> Internal Panel (Port 20000)
 RUN echo 'events { worker_connections 1024; } \
 http { \
     include       mime.types; \
@@ -97,13 +93,11 @@ function checkAuth(req, res, next) {
 
 // --- API ROUTES ---
 
-// Auth
 app.post('/api/auth', (req, res) => {
     const { username, password } = req.body;
     let users = {};
     if (fs.existsSync(USERS_FILE)) users = fs.readJsonSync(USERS_FILE, { throws: false }) || {};
     
-    // First time setup
     if (Object.keys(users).length === 0) {
         users[username] = password;
         fs.writeJsonSync(USERS_FILE, users);
@@ -123,7 +117,6 @@ app.get('/api/check-setup', (req, res) => {
     res.json({ setupNeeded: Object.keys(users).length === 0 });
 });
 
-// Server Control
 app.post('/api/start', checkAuth, (req, res) => {
     if (mcProcess) return res.json({ msg: 'Server already running' });
     
@@ -131,11 +124,10 @@ app.post('/api/start', checkAuth, (req, res) => {
     const ram = settings.ram || "1G";
     const jar = settings.jar || "server.jar";
     
-    if (!fs.existsSync(jar)) return res.json({ msg: `File '${jar}' not found! Go to Settings to install one.` });
+    if (!fs.existsSync(jar)) return res.json({ msg: `File '${jar}' not found! Install a version first.` });
 
     io.emit('log', `\n>>> STARTING SERVER (RAM: ${ram}, JAR: ${jar})...\n`);
     
-    // Start Java
     mcProcess = spawn('java', [`-Xmx${ram}`, `-Xms${ram}`, '-jar', jar, 'nogui']);
     
     mcProcess.stdout.on('data', d => {
@@ -143,7 +135,7 @@ app.post('/api/start', checkAuth, (req, res) => {
         consoleLog.push(line);
         if (consoleLog.length > 500) consoleLog.shift();
         io.emit('log', line);
-        process.stdout.write(line); // Print to Railway logs too
+        process.stdout.write(line);
     });
     
     mcProcess.stderr.on('data', d => {
@@ -171,38 +163,63 @@ app.post('/api/stop', checkAuth, (req, res) => {
     }
 });
 
-// Settings API
 app.get('/api/settings', checkAuth, (req, res) => res.json(getSettings()));
 app.post('/api/settings', checkAuth, (req, res) => {
     saveSettings(req.body);
     res.json({ success: true });
 });
 
-// Installer API
-app.post('/api/install', checkAuth, async (req, res) => {
-    const { url, type, filename } = req.body;
-    const targetDir = type === 'plugin' ? 'plugins' : '.';
-    fs.ensureDirSync(targetDir);
-    const targetPath = path.join(targetDir, filename);
+// --- SMART VERSION INSTALLER ---
+app.post('/api/install-version', checkAuth, async (req, res) => {
+    const { version } = req.body; // User types "1.21.1"
     
     try {
-        io.emit('log', `\n>>> DOWNLOADING ${filename}...\n`);
-        const response = await axios({ method: 'get', url: url, responseType: 'stream' });
-        const writer = fs.createWriteStream(targetPath);
+        io.emit('log', `\n>>> FETCHING PAPER BUILD FOR ${version}...\n`);
+        
+        // 1. Get Build Info from Paper API
+        const metaRes = await axios.get(`https://api.papermc.io/v2/projects/paper/versions/${version}`);
+        const builds = metaRes.data.builds;
+        const latestBuild = builds[builds.length - 1]; // Get latest build number
+        const jarName = `paper-${version}-${latestBuild}.jar`;
+        const downloadUrl = `https://api.papermc.io/v2/projects/paper/versions/${version}/builds/${latestBuild}/downloads/${jarName}`;
+        
+        io.emit('log', `>>> FOUND BUILD #${latestBuild}. DOWNLOADING...\n`);
+
+        // 2. Download File
+        const response = await axios({ method: 'get', url: downloadUrl, responseType: 'stream' });
+        const targetFilename = `server-${version}.jar`;
+        const writer = fs.createWriteStream(targetFilename);
         response.data.pipe(writer);
         
         writer.on('finish', () => {
-            io.emit('log', `>>> INSTALLED ${filename} SUCCESSFULLY!\n`);
-            if (type === 'jar') saveSettings({ jar: filename });
+            io.emit('log', `>>> SUCCESS! Installed ${targetFilename}. Setting as active...\n`);
+            saveSettings({ jar: targetFilename });
             res.json({ success: true });
         });
     } catch (err) {
-        io.emit('log', `>>> ERROR: ${err.message}\n`);
+        io.emit('log', `>>> ERROR: Could not find version ${version}. Check spelling!\n`);
         res.json({ success: false, msg: err.message });
     }
 });
 
-// File Manager API
+// Custom Plugin Installer
+app.post('/api/install-custom', checkAuth, async (req, res) => {
+    const { url, filename } = req.body;
+    fs.ensureDirSync('plugins');
+    const targetPath = path.join('plugins', filename);
+    
+    try {
+        io.emit('log', `\n>>> DOWNLOADING PLUGIN ${filename}...\n`);
+        const response = await axios({ method: 'get', url: url, responseType: 'stream' });
+        const writer = fs.createWriteStream(targetPath);
+        response.data.pipe(writer);
+        writer.on('finish', () => {
+            io.emit('log', `>>> PLUGIN INSTALLED!\n`);
+            res.json({ success: true });
+        });
+    } catch (err) { res.json({ success: false, msg: err.message }); }
+});
+
 app.get('/api/files', checkAuth, (req, res) => {
     const dir = req.query.path || '.';
     if(dir.includes('..')) return res.json([]); 
@@ -217,7 +234,7 @@ app.post('/api/upload', checkAuth, upload.single('file'), (req, res) => {
         if (req.file.originalname.endsWith('.zip')) {
             try {
                 const zip = new AdmZip(req.file.path);
-                zip.extractAllTo('.', true); // Auto-unzip
+                zip.extractAllTo('.', true); 
             } catch(e) { console.error(e); }
         } else {
             fs.moveSync(req.file.path, path.join('.', req.file.originalname), { overwrite: true });
@@ -227,7 +244,6 @@ app.post('/api/upload', checkAuth, upload.single('file'), (req, res) => {
     res.redirect('/');
 });
 
-// Socket.io
 io.on('connection', (socket) => {
     socket.emit('history', consoleLog.join(''));
     socket.emit('status', mcProcess ? 'running' : 'stopped');
@@ -236,55 +252,18 @@ io.on('connection', (socket) => {
     });
 });
 
-// Listen on INTERNAL Port 20000 (Nginx will forward to here)
 server.listen(20000, '127.0.0.1', () => console.log('INTERNAL PANEL RUNNING ON 20000'));
 EOF
 
-# --- 6. FRONTEND FILES (The Professional UI) ---
+# --- 6. FRONTEND (The Professional UI) ---
 RUN mkdir public
 
-# LOGIN PAGE
+# LOGIN
 RUN cat << 'EOF' > public/login.html
-<!DOCTYPE html>
-<html>
-<head>
-    <title>Login</title>
-    <style>
-        body{background:#111;color:#eee;font-family:sans-serif;display:flex;justify-content:center;align-items:center;height:100vh;margin:0}
-        .box{background:#1e1e1e;padding:40px;border-radius:12px;width:300px;text-align:center;border:1px solid #333}
-        input{display:block;margin:15px 0;padding:12px;width:100%;box-sizing:border-box;background:#333;border:1px solid #444;color:white;border-radius:6px}
-        button{width:100%;padding:12px;background:#6200ea;color:white;border:none;border-radius:6px;cursor:pointer;font-weight:bold}
-        button:hover{opacity:0.9}
-    </style>
-</head>
-<body>
-<div class="box">
-    <h2 id="title">Login</h2>
-    <input type="text" id="user" placeholder="Username">
-    <input type="password" id="pass" placeholder="Password">
-    <button onclick="login()">Login</button>
-</div>
-<script>
-    fetch('/api/check-setup').then(r=>r.json()).then(d => {
-        if(d.setupNeeded) document.getElementById('title').innerText = 'Create Admin Account';
-    });
-    async function login() {
-        const u = document.getElementById('user').value;
-        const p = document.getElementById('pass').value;
-        const res = await fetch('/api/auth', { 
-            method:'POST', headers:{'Content-Type':'application/json'}, 
-            body: JSON.stringify({username:u, password:p}) 
-        });
-        const data = await res.json();
-        if(data.success) location.href = '/';
-        else alert(data.msg);
-    }
-</script>
-</body>
-</html>
+<!DOCTYPE html><html><head><title>Login</title><style>body{background:#111;color:#eee;font-family:sans-serif;display:flex;justify-content:center;align-items:center;height:100vh;margin:0}.box{background:#1e1e1e;padding:40px;border-radius:12px;width:300px;text-align:center;border:1px solid #333}input{display:block;margin:15px 0;padding:12px;width:100%;box-sizing:border-box;background:#333;border:1px solid #444;color:white;border-radius:6px}button{width:100%;padding:12px;background:#6200ea;color:white;border:none;border-radius:6px;cursor:pointer;font-weight:bold}button:hover{opacity:0.9}</style></head><body><div class="box"><h2 id="title">Login</h2><input type="text" id="user" placeholder="Username"><input type="password" id="pass" placeholder="Password"><button onclick="login()">Login</button></div><script>fetch('/api/check-setup').then(r=>r.json()).then(d=>{if(d.setupNeeded)document.getElementById('title').innerText='Create Admin Account'});async function login(){const u=document.getElementById('user').value;const p=document.getElementById('pass').value;const res=await fetch('/api/auth',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({username:u,password:p})});const data=await res.json();if(data.success)location.href='/';else alert(data.msg)}</script></body></html>
 EOF
 
-# DASHBOARD PAGE
+# DASHBOARD
 RUN cat << 'EOF' > public/index.html
 <!DOCTYPE html>
 <html lang="en">
@@ -304,25 +283,21 @@ RUN cat << 'EOF' > public/index.html
         .main { flex: 1; padding: 25px; display: flex; flex-direction: column; gap: 20px; overflow-y: auto; }
         .card { background: var(--panel); padding: 20px; border-radius: 12px; border: 1px solid #333; }
         h3 { margin-top: 0; border-bottom: 1px solid #333; padding-bottom: 10px; }
-
         #terminal { background: #000; height: 400px; overflow-y: auto; padding: 15px; font-family: monospace; white-space: pre-wrap; font-size: 13px; border-radius: 8px; border: 1px solid #333; }
-        input { padding: 12px; background: #222; border: 1px solid #444; color: white; border-radius: 6px; width: 100%; box-sizing: border-box; outline: none; }
-        
+        input, select { padding: 12px; background: #222; border: 1px solid #444; color: white; border-radius: 6px; width: 100%; box-sizing: border-box; outline: none; }
         button { padding: 10px; border: none; border-radius: 6px; cursor: pointer; font-weight: bold; }
         .btn-primary { background: var(--accent); color: white; }
         .btn-green { background: #03dac6; color: black; }
         .btn-red { background: #cf6679; color: black; }
-        
         .section { display: none; }
         .section.active { display: block; }
-        
         .file-item { padding: 10px; border-bottom: 1px solid #333; display: flex; align-items: center; gap: 10px; }
     </style>
 </head>
 <body>
 
 <div class="sidebar">
-    <h2><i class="fa-solid fa-cube"></i> MC PANEL</h2>
+    <h2><i class="fa-solid fa-cube"></i> PANEL</h2>
     <button onclick="show('console')" class="nav-btn active" id="btn-console"><i class="fa-solid fa-terminal"></i> Console</button>
     <button onclick="show('files')" class="nav-btn" id="btn-files"><i class="fa-solid fa-folder"></i> Files</button>
     <button onclick="show('settings')" class="nav-btn" id="btn-settings"><i class="fa-solid fa-gear"></i> Settings</button>
@@ -348,7 +323,7 @@ RUN cat << 'EOF' > public/index.html
                  <button class="btn-primary" onclick="send('gamemode creative @a')">GM Creative</button>
                  <button class="btn-primary" onclick="send('gamemode survival @a')">GM Survival</button>
                  <button class="btn-primary" onclick="send('time set day')">Time Day</button>
-                 <button class="btn-primary" onclick="send('weather clear')">Clear Weather</button>
+                 <button class="btn-primary" onclick="send('save-all')">Save World</button>
              </div>
         </div>
     </div>
@@ -373,19 +348,26 @@ RUN cat << 'EOF' > public/index.html
             <h3>Server Settings</h3>
             <p><strong>Max RAM:</strong> (e.g. 1G, 2G, 4G)</p>
             <input id="ramInput" placeholder="1G">
-            <p><strong>JAR File:</strong> (e.g. server.jar)</p>
-            <input id="jarInput" placeholder="server.jar">
+            
             <button onclick="saveSettings()" class="btn-primary" style="margin-top:15px; width:100%">SAVE SETTINGS</button>
         </div>
 
         <div class="card" style="margin-top:20px">
-            <h3>Installer</h3>
-            <p>Install Version / Plugin via URL</p>
-            <input id="installUrl" placeholder="https://..." style="margin-bottom:10px">
-            <input id="installName" placeholder="Filename (e.g. server.jar)" style="margin-bottom:10px">
+            <h3>Smart Version Installer</h3>
+            <p>Enter a Minecraft Version (e.g. <code>1.21.1</code>, <code>1.20.4</code>, <code>1.16.5</code>)</p>
             <div style="display:flex; gap:10px">
-                <button onclick="install('jar')" class="btn-primary" style="flex:1">Install as Server JAR</button>
-                <button onclick="install('plugin')" class="btn-primary" style="flex:1">Install as Plugin</button>
+                <input id="versionInput" placeholder="1.21.4" style="flex:1">
+                <button onclick="installVersion()" class="btn-green" style="width:150px">INSTALL</button>
+            </div>
+            <p style="font-size:12px; color:#888; margin-top:5px">This will auto-fetch the latest Paper build.</p>
+        </div>
+
+        <div class="card" style="margin-top:20px">
+            <h3>Plugin Installer</h3>
+            <div style="display:flex; gap:10px">
+                <input id="pluginUrl" placeholder="https://example.com/plugin.jar" style="flex:2">
+                <input id="pluginName" placeholder="Name.jar" style="flex:1">
+                <button onclick="installPlugin()" class="btn-primary" style="width:100px">Get</button>
             </div>
         </div>
     </div>
@@ -397,7 +379,6 @@ RUN cat << 'EOF' > public/index.html
     const socket = io();
     const term = document.getElementById('terminal');
     
-    // UI Switcher
     function show(id) {
         document.querySelectorAll('.section').forEach(el => el.classList.remove('active'));
         document.getElementById(id).classList.add('active');
@@ -405,7 +386,6 @@ RUN cat << 'EOF' > public/index.html
         document.getElementById('btn-'+id).classList.add('active');
     }
 
-    // Console
     socket.on('log', msg => {
         const d = document.createElement('div'); d.innerText = msg; term.appendChild(d);
         term.scrollTop = term.scrollHeight;
@@ -419,36 +399,42 @@ RUN cat << 'EOF' > public/index.html
     function send(c) { socket.emit('command', c); }
     document.getElementById('cmdInput').addEventListener('keypress', e => { if(e.key === 'Enter') sendCmd(); });
 
-    // API Calls
     function api(act) { fetch('/api/'+act, { method:'POST' }); }
     
     async function loadSettings() {
         const res = await fetch('/api/settings');
         const data = await res.json();
         document.getElementById('ramInput').value = data.ram;
-        document.getElementById('jarInput').value = data.jar;
     }
     
     async function saveSettings() {
         const ram = document.getElementById('ramInput').value;
-        const jar = document.getElementById('jarInput').value;
         await fetch('/api/settings', {
             method:'POST', headers:{'Content-Type':'application/json'},
-            body: JSON.stringify({ram, jar})
+            body: JSON.stringify({ram})
         });
         alert('Saved!');
     }
     
-    async function install(type) {
-        const url = document.getElementById('installUrl').value;
-        const filename = document.getElementById('installName').value;
-        if(!url || !filename) return alert('Enter URL and Filename');
-        if(!confirm('Download ' + filename + '?')) return;
-        
+    async function installVersion() {
+        const version = document.getElementById('versionInput').value;
+        if(!version) return alert('Enter a version like 1.21.1');
+        if(!confirm('Install Paper ' + version + '?')) return;
         show('console');
-        fetch('/api/install', {
+        fetch('/api/install-version', {
             method:'POST', headers:{'Content-Type':'application/json'},
-            body: JSON.stringify({type, url, filename})
+            body: JSON.stringify({version})
+        });
+    }
+
+    async function installPlugin() {
+        const url = document.getElementById('pluginUrl').value;
+        const filename = document.getElementById('pluginName').value;
+        if(!url || !filename) return alert('Enter Link & Name');
+        show('console');
+        fetch('/api/install-custom', {
+            method:'POST', headers:{'Content-Type':'application/json'},
+            body: JSON.stringify({url, filename})
         });
     }
 
