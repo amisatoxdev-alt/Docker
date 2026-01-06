@@ -66,7 +66,6 @@ function saveConfig(cfg) {
     fs.writeJsonSync(CONFIG_FILE, cfg);
 }
 
-// Helper to update server.properties safely
 function updateProperties(updates) {
     let content = "";
     if (fs.existsSync(PROPS_FILE)) content = fs.readFileSync(PROPS_FILE, 'utf8');
@@ -165,11 +164,10 @@ function stopServer() {
 }
 
 // --- WEB APP ---
-app.use(express.static('public')); // Serves login.html, css, js
+app.use(express.static('public')); 
 app.use(bodyParser.json());
 app.use(session({ secret: 'secure-panel-secret', resave: false, saveUninitialized: false, cookie: { maxAge: 3600000 } }));
 
-// AUTH MIDDLEWARE
 function checkAuth(req, res, next) {
     if (req.session.loggedin) {
         next();
@@ -179,13 +177,10 @@ function checkAuth(req, res, next) {
 }
 
 // ROUTES
-
-// 1. Dashboard (Protected)
 app.get('/', checkAuth, (req, res) => {
     res.sendFile(path.join(__dirname, 'views', 'dashboard.html'));
 });
 
-// 2. Auth API
 app.get('/api/check-setup', (req, res) => {
     let users = fs.existsSync(USER_FILE) ? fs.readJsonSync(USER_FILE, { throws: false }) || {} : {};
     res.json({ setupNeeded: Object.keys(users).length === 0 });
@@ -216,7 +211,6 @@ app.get('/api/logout', (req, res) => {
     res.redirect('/login.html');
 });
 
-// 3. Settings API
 app.get('/api/settings', checkAuth, (req, res) => {
     const cfg = getConfig();
     res.json({ 
@@ -231,40 +225,26 @@ app.post('/api/settings', checkAuth, async (req, res) => {
         const { ram, version, viewDistance } = req.body;
         const oldConfig = getConfig();
         
-        console.log(`[Settings] Saving: RAM=${ram}, Ver=${version}, Dist=${viewDistance}`);
-        
-        // 1. Save Configs
         saveConfig({ ram, version });
         updateProperties({ 'view-distance': viewDistance });
 
-        // 2. Send Success Response BEFORE restarting
         res.json({ success: true });
 
-        // 3. Handle Restart/Update Asynchronously
         if (version !== oldConfig.version) {
-            console.log('[Settings] Version change detected. Restarting...');
             if (serverStatus !== 'offline') stopServer();
-            
-            // Wait a bit for stop, then download and start
             setTimeout(async () => {
                 try { 
-                    if(fs.existsSync('server.jar')) fs.unlinkSync('server.jar'); // Clear old jar
+                    if(fs.existsSync('server.jar')) fs.unlinkSync('server.jar');
                     await downloadServerJar(version); 
                     startServer(); 
                 } catch(e) { console.error('Update failed', e); }
             }, 5000);
-        } else {
-            // Just update props (render distance)
-             console.log('[Settings] Properties updated.');
         }
-
     } catch(e) {
-        console.error(e);
         res.status(500).json({ success: false, msg: e.message });
     }
 });
 
-// 4. File APIs
 app.post('/api/world/upload', checkAuth, upload.single('file'), (req, res) => {
     if (serverStatus !== 'offline') return res.status(400).send('Stop server first');
     try {
@@ -292,7 +272,6 @@ app.post('/api/plugins/delete', checkAuth, (req, res) => {
     try { fs.removeSync(path.join(PLUGINS_DIR, req.body.filename)); res.json({ success: true }); } catch(e){ res.json({ success: false });}
 });
 
-// --- SOCKET ---
 io.on('connection', (socket) => {
     socket.emit('history', logs.join(''));
     socket.emit('status', serverStatus);
@@ -304,12 +283,13 @@ io.on('connection', (socket) => {
     });
 });
 
-// Start
 const port = process.env.PANEL_PORT || 20000;
 server.listen(port, () => console.log(`Dashboard running on port ${port}`));
 EOF
 
 # --- 5. FRONTEND FILES ---
+# !!! FIX: Create directories before writing files !!!
+RUN mkdir -p public views
 
 # LOGIN (Public)
 RUN cat << 'EOF' > public/login.html
@@ -339,7 +319,7 @@ RUN cat << 'EOF' > public/login.html
         try {
             const res=await fetch('/api/auth',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({username:user,password:pass,action})});
             const data=await res.json();
-            if(data.success) location.reload(); // Reloads to root, which will serve dashboard
+            if(data.success) location.reload(); 
             else alert(data.msg);
         } catch(err) { alert('Connection Error'); }
     }
@@ -348,7 +328,7 @@ RUN cat << 'EOF' > public/login.html
 </html>
 EOF
 
-# DASHBOARD (Protected - Moved to 'views' folder so it can't be accessed without login)
+# DASHBOARD (Protected - in views folder)
 RUN cat << 'EOF' > views/dashboard.html
 <!DOCTYPE html>
 <html lang="en">
