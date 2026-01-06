@@ -88,8 +88,8 @@ function updateProperties(updates) {
 function getProp(key, def) {
     if (!fs.existsSync(PROPS_FILE)) return def;
     const content = fs.readFileSync(PROPS_FILE, 'utf8');
-    const match = content.match(new RegExp(`${key}=(\\d+)`));
-    return match ? parseInt(match[1]) : def;
+    const match = content.match(new RegExp(`${key}=(.*)`)); // Changed regex to capture string
+    return match ? match[1].trim() : def;
 }
 
 // --- MC LOGIC ---
@@ -196,12 +196,10 @@ app.post('/api/auth', (req, res) => {
         users[username] = password;
         fs.writeJsonSync(USER_FILE, users);
         req.session.loggedin = true;
-        // Save session before redirect
         req.session.save(() => { res.json({ success: true }); });
     } else {
         if (users[username] && users[username] === password) {
             req.session.loggedin = true;
-            // Save session before redirect
             req.session.save(() => { res.json({ success: true }); });
         } else {
             res.json({ success: false, msg: 'Invalid credentials' });
@@ -214,25 +212,31 @@ app.get('/api/logout', (req, res) => {
     res.redirect('/login.html');
 });
 
+// Settings API - Added Online Mode
 app.get('/api/settings', checkAuth, (req, res) => {
     const cfg = getConfig();
     res.json({ 
         ram: cfg.ram, 
         version: cfg.version, 
-        viewDistance: getProp('view-distance', 10) 
+        viewDistance: getProp('view-distance', '10'),
+        onlineMode: getProp('online-mode', 'true')
     });
 });
 
 app.post('/api/settings', checkAuth, async (req, res) => {
     try {
-        const { ram, version, viewDistance } = req.body;
+        const { ram, version, viewDistance, onlineMode } = req.body;
         const oldConfig = getConfig();
         
         saveConfig({ ram, version });
-        updateProperties({ 'view-distance': viewDistance });
+        updateProperties({ 
+            'view-distance': viewDistance,
+            'online-mode': onlineMode
+        });
 
         res.json({ success: true });
 
+        // Restart if version changed, or just log config change
         if (version !== oldConfig.version) {
             if (serverStatus !== 'offline') stopServer();
             setTimeout(async () => {
@@ -242,21 +246,36 @@ app.post('/api/settings', checkAuth, async (req, res) => {
                     startServer(); 
                 } catch(e) { console.error('Update failed', e); }
             }, 5000);
+        } else {
+            // If just online mode changed, suggest restart in logs
+            io.emit('log', '[System] Settings updated. Restart server to apply changes.');
         }
+
     } catch(e) {
         res.status(500).json({ success: false, msg: e.message });
     }
 });
 
+// World Upload API - Improved with Feedback
 app.post('/api/world/upload', checkAuth, upload.single('file'), (req, res) => {
-    if (serverStatus !== 'offline') return res.status(400).send('Stop server first');
+    if (serverStatus !== 'offline') return res.status(400).json({success: false, msg: 'Stop server first'});
+    
+    io.emit('log', '[System] World Zip Received. Starting extraction...');
+    
     try {
         if (fs.existsSync('world')) fs.rmSync('world', { recursive: true, force: true });
+        
         const zip = new AdmZip(req.file.path);
         zip.extractAllTo('.', true);
+        
         fs.unlinkSync(req.file.path);
-        res.redirect('/');
-    } catch(e) { res.status(500).send(e.message); }
+        io.emit('log', '[System] World extracted successfully! You can now start the server.');
+        
+        res.json({ success: true });
+    } catch(e) { 
+        io.emit('log', '[System] Error extracting world: ' + e.message);
+        res.status(500).json({ success: false, msg: e.message }); 
+    }
 });
 
 app.get('/api/plugins', checkAuth, (req, res) => {
@@ -293,7 +312,7 @@ EOF
 # --- 5. FRONTEND FILES ---
 RUN mkdir -p public views
 
-# LOGIN (Public) - FIX: Use window.location.href instead of reload
+# LOGIN (Public)
 RUN cat << 'EOF' > public/login.html
 <!DOCTYPE html>
 <html lang="en">
@@ -321,7 +340,6 @@ RUN cat << 'EOF' > public/login.html
         try {
             const res=await fetch('/api/auth',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({username:user,password:pass,action})});
             const data=await res.json();
-            // THIS LINE FIXED: Redirects to dashboard instead of reloading login page
             if(data.success) window.location.href = '/'; 
             else alert(data.msg);
         } catch(err) { alert('Connection Error'); }
@@ -331,7 +349,7 @@ RUN cat << 'EOF' > public/login.html
 </html>
 EOF
 
-# DASHBOARD (Protected - in views folder)
+# DASHBOARD (Protected)
 RUN cat << 'EOF' > views/dashboard.html
 <!DOCTYPE html>
 <html lang="en">
@@ -376,9 +394,14 @@ RUN cat << 'EOF' > views/dashboard.html
     .input-bar { display: flex; padding: 10px; border-top: 1px solid #334155; background: #1e232e; }
     #cmdInput { flex: 1; background: transparent; border: none; color: white; outline: none; font-family: monospace; }
     
-    input[type="text"], input[type="number"], input[type="file"] { width: 100%; padding: 10px; background: #0f172a; border: 1px solid #334155; border-radius: 6px; color: white; }
+    input[type="text"], input[type="number"], input[type="file"], select { width: 100%; padding: 10px; background: #0f172a; border: 1px solid #334155; border-radius: 6px; color: white; margin-bottom: 5px; }
     .control-row { display: flex; gap: 10px; margin-top: 10px; flex-wrap: wrap; }
     .file-item { display: flex; justify-content: space-between; padding: 10px; border-bottom: 1px solid #334155; font-size: 14px; }
+    
+    /* Progress Bar */
+    .progress-container { width: 100%; background-color: #334155; border-radius: 6px; margin-top: 10px; display: none; }
+    .progress-bar { width: 0%; height: 20px; background-color: var(--success); border-radius: 6px; text-align: center; font-size: 12px; line-height: 20px; transition: 0.2s; }
+
 </style>
 </head>
 <body>
@@ -447,10 +470,13 @@ RUN cat << 'EOF' > views/dashboard.html
         <div class="card">
             <h3>Upload World (.zip)</h3>
             <p style="color:#ef4444; font-size:13px; margin-bottom:15px">Warning: Overwrites current world. Stop server first.</p>
-            <form action="/api/world/upload" method="POST" enctype="multipart/form-data" style="display:flex; gap:10px">
-                <input type="file" name="file" accept=".zip" required>
-                <button type="submit" class="btn btn-red">Upload & Replace</button>
-            </form>
+            
+            <input type="file" id="worldFile" accept=".zip" style="margin-bottom:10px">
+            <button class="btn btn-red" onclick="uploadWorld()">Upload & Replace</button>
+            
+            <div id="uploadProgress" class="progress-container">
+                <div id="progressBar" class="progress-bar">0%</div>
+            </div>
         </div>
     </div>
 
@@ -477,6 +503,13 @@ RUN cat << 'EOF' > views/dashboard.html
                 <div><label>Allocated RAM (GB)</label><input type="number" id="ramInput"></div>
                 <div><label>Minecraft Version (Paper)</label><input type="text" id="verInput"></div>
                 <div><label>Render Distance</label><input type="number" id="distInput"></div>
+                <div>
+                    <label>Online Mode (Premium/Cracked)</label>
+                    <select id="onlineModeInput">
+                        <option value="true">True (Premium Only)</option>
+                        <option value="false">False (Cracked / TLauncher)</option>
+                    </select>
+                </div>
                 <div style="text-align:right">
                     <button class="btn btn-blue" id="saveBtn" onclick="saveSettings()">Save Configuration</button>
                 </div>
@@ -546,31 +579,65 @@ RUN cat << 'EOF' > views/dashboard.html
             document.getElementById('ramInput').value = d.ram;
             document.getElementById('verInput').value = d.version;
             document.getElementById('distInput').value = d.viewDistance;
+            document.getElementById('onlineModeInput').value = d.onlineMode;
         });
     }
 
     function saveSettings() {
         const btn = document.getElementById('saveBtn');
-        btn.textContent = "Saving...";
-        btn.disabled = true;
+        btn.textContent = "Saving..."; btn.disabled = true;
 
         const data = {
             ram: document.getElementById('ramInput').value,
             version: document.getElementById('verInput').value,
-            viewDistance: document.getElementById('distInput').value
+            viewDistance: document.getElementById('distInput').value,
+            onlineMode: document.getElementById('onlineModeInput').value
         };
 
         fetch('/api/settings', {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(data)})
         .then(r=>r.json()).then(d => { 
-            btn.textContent = "Save Configuration";
-            btn.disabled = false;
-            if(d.success) alert('Settings Saved! If you changed the version, the server is restarting now.');
-            else alert('Error saving settings');
-        }).catch(e => {
-            btn.textContent = "Save Configuration";
-            btn.disabled = false;
-            alert('Connection Error');
+            btn.textContent = "Save Configuration"; btn.disabled = false;
+            if(d.success) alert('Settings Saved! Restart server to apply.');
+            else alert('Error: ' + d.msg);
         });
+    }
+
+    // New World Upload with Progress
+    function uploadWorld() {
+        const fileInput = document.getElementById('worldFile');
+        if(fileInput.files.length === 0) return alert('Please select a zip file');
+
+        const file = fileInput.files[0];
+        const formData = new FormData();
+        formData.append('file', file);
+
+        const xhr = new XMLHttpRequest();
+        const pBar = document.getElementById('progressBar');
+        const pContainer = document.getElementById('uploadProgress');
+
+        pContainer.style.display = 'block';
+
+        xhr.upload.onprogress = function(e) {
+            if (e.lengthComputable) {
+                const percentComplete = Math.round((e.loaded / e.total) * 100);
+                pBar.style.width = percentComplete + '%';
+                pBar.textContent = percentComplete + '%';
+            }
+        };
+
+        xhr.onload = function() {
+            if (xhr.status === 200) {
+                alert('Upload Complete! Check console logs for extraction status.');
+                pBar.style.backgroundColor = '#22c55e';
+                pBar.textContent = 'Done';
+            } else {
+                alert('Upload Failed: ' + xhr.responseText);
+                pBar.style.backgroundColor = '#ef4444';
+            }
+        };
+
+        xhr.open('POST', '/api/world/upload', true);
+        xhr.send(formData);
     }
 </script>
 </body>
