@@ -165,7 +165,8 @@ function stopServer() {
 
 // --- WEB APP ---
 app.use(express.static('public')); 
-app.use(bodyParser.json());
+app.use(bodyParser.json({ limit: '500mb' }));
+app.use(bodyParser.urlencoded({ limit: '500mb', extended: true }));
 app.use(session({ secret: 'secure-panel-secret', resave: false, saveUninitialized: false, cookie: { maxAge: 3600000 } }));
 
 function checkAuth(req, res, next) {
@@ -195,11 +196,13 @@ app.post('/api/auth', (req, res) => {
         users[username] = password;
         fs.writeJsonSync(USER_FILE, users);
         req.session.loggedin = true;
-        res.json({ success: true });
+        // Save session before redirect
+        req.session.save(() => { res.json({ success: true }); });
     } else {
         if (users[username] && users[username] === password) {
             req.session.loggedin = true;
-            res.json({ success: true });
+            // Save session before redirect
+            req.session.save(() => { res.json({ success: true }); });
         } else {
             res.json({ success: false, msg: 'Invalid credentials' });
         }
@@ -288,10 +291,9 @@ server.listen(port, () => console.log(`Dashboard running on port ${port}`));
 EOF
 
 # --- 5. FRONTEND FILES ---
-# !!! FIX: Create directories before writing files !!!
 RUN mkdir -p public views
 
-# LOGIN (Public)
+# LOGIN (Public) - FIX: Use window.location.href instead of reload
 RUN cat << 'EOF' > public/login.html
 <!DOCTYPE html>
 <html lang="en">
@@ -319,7 +321,8 @@ RUN cat << 'EOF' > public/login.html
         try {
             const res=await fetch('/api/auth',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({username:user,password:pass,action})});
             const data=await res.json();
-            if(data.success) location.reload(); 
+            // THIS LINE FIXED: Redirects to dashboard instead of reloading login page
+            if(data.success) window.location.href = '/'; 
             else alert(data.msg);
         } catch(err) { alert('Connection Error'); }
     }
