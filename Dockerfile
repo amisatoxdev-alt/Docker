@@ -2,10 +2,10 @@ FROM ubuntu:22.04
 
 # --- 1. SETUP ENVIRONMENT ---
 ENV DEBIAN_FRONTEND=noninteractive
-ENV PORT=8080
+# We use a specific variable for the Web Panel to avoid conflicts
+ENV PANEL_PORT=20000
 
 # --- 2. INSTALL DEPENDENCIES ---
-# Install Java 21, Node.js, and utilities
 RUN apt-get update && apt-get install -y \
     curl wget git tar sudo unzip zip \
     openjdk-21-jre-headless \
@@ -18,15 +18,14 @@ RUN curl -fsSL https://deb.nodesource.com/setup_20.x | bash - \
 # --- 3. SETUP APP DIRECTORY ---
 WORKDIR /app
 
-# Initialize Node and install dependencies (added axios for downloading files)
+# Initialize Node and install dependencies
 RUN npm init -y && \
     npm install express socket.io multer fs-extra body-parser express-session adm-zip axios
 
-# Default Config & EULA
+# Accept EULA
 RUN echo "eula=true" > eula.txt
 
 # --- 4. CREATE BACKEND (server.js) ---
-# We use a quoted heredoc ('EOF') so ${} syntax in JS is not interpreted by Docker
 RUN cat << 'EOF' > server.js
 const express = require('express');
 const http = require('http');
@@ -37,7 +36,6 @@ const path = require('path');
 const session = require('express-session');
 const bodyParser = require('body-parser');
 const multer = require('multer');
-const AdmZip = require('adm-zip');
 const axios = require('axios');
 
 const app = express();
@@ -45,27 +43,26 @@ const server = http.createServer(app);
 const io = new Server(server);
 const upload = multer({ dest: 'temp_uploads/' });
 
-// --- CONSTANTS & STATE ---
+// --- CONSTANTS ---
 const USER_FILE = 'users.json';
 const CONFIG_FILE = 'server_config.json';
+const PROPS_FILE = 'server.properties';
 const PLUGINS_DIR = 'plugins';
 
 // Default Config
 const DEFAULT_CONFIG = {
-    ram: "2", // GB
+    ram: "4", // GB
     version: "1.20.4",
-    jar: "server.jar",
-    autoRestart: true
+    jar: "server.jar"
 };
 
 let mcProcess = null;
 let logs = [];
-let serverStatus = 'offline'; // offline, starting, online, stopping
+let serverStatus = 'offline';
 
-// Ensure Dirs
 fs.ensureDirSync(PLUGINS_DIR);
 
-// --- HELPERS ---
+// --- CONFIG HELPERS ---
 function getConfig() {
     if (!fs.existsSync(CONFIG_FILE)) fs.writeJsonSync(CONFIG_FILE, DEFAULT_CONFIG);
     return fs.readJsonSync(CONFIG_FILE);
@@ -75,11 +72,28 @@ function saveConfig(cfg) {
     fs.writeJsonSync(CONFIG_FILE, cfg);
 }
 
-// Download PaperMC Logic
+// Force server.properties to use port 25565 for the game
+function ensureServerProps() {
+    let props = "";
+    if (fs.existsSync(PROPS_FILE)) {
+        props = fs.readFileSync(PROPS_FILE, 'utf8');
+    }
+    // Simple regex to ensure server-port is 25565
+    if (!props.includes('server-port=25565')) {
+        if (props.includes('server-port=')) {
+            props = props.replace(/server-port=\d+/g, 'server-port=25565');
+        } else {
+            props += '\nserver-port=25565\n';
+        }
+        fs.writeFileSync(PROPS_FILE, props);
+        console.log('[System] Enforced Game Port 25565 in server.properties');
+    }
+}
+
+// --- MINECRAFT DOWNLOADER ---
 async function downloadServerJar(version) {
     try {
-        io.emit('log', `\n[System] Fetching latest build for Paper ${version}...`);
-        // Get Project Info
+        io.emit('log', `\n[System] Fetching PaperMC ${version}...`);
         const projectUrl = `https://api.papermc.io/v2/projects/paper/versions/${version}`;
         const projectRes = await axios.get(projectUrl);
         const builds = projectRes.data.builds;
@@ -87,14 +101,10 @@ async function downloadServerJar(version) {
         
         const downloadUrl = `https://api.papermc.io/v2/projects/paper/versions/${version}/builds/${latestBuild}/downloads/paper-${version}-${latestBuild}.jar`;
         
-        io.emit('log', `[System] Downloading from: ${downloadUrl}`);
+        io.emit('log', `[System] Downloading build #${latestBuild}...`);
         
         const writer = fs.createWriteStream('server.jar');
-        const response = await axios({
-            url: downloadUrl,
-            method: 'GET',
-            responseType: 'stream'
-        });
+        const response = await axios({ url: downloadUrl, method: 'GET', responseType: 'stream' });
 
         response.data.pipe(writer);
 
@@ -108,23 +118,20 @@ async function downloadServerJar(version) {
     }
 }
 
-// --- EXPRESS MIDDLEWARE ---
+// --- EXPRESS SETUP ---
 app.use(express.static('public'));
 app.use(bodyParser.json());
 app.use(bodyParser.urlencoded({ extended: true }));
-app.use(session({ secret: 'super-secret-key-change-me', resave: false, saveUninitialized: true }));
+app.use(session({ secret: 'secure-panel-secret', resave: false, saveUninitialized: true }));
 
 function checkAuth(req, res, next) {
     if (req.session.loggedin) next();
     else res.redirect('/login.html');
 }
 
-// --- API ROUTES ---
-
-// Auth
+// --- ROUTES ---
 app.get('/api/check-setup', (req, res) => {
-    let users = {};
-    if (fs.existsSync(USER_FILE)) users = fs.readJsonSync(USER_FILE, { throws: false }) || {};
+    let users = fs.existsSync(USER_FILE) ? fs.readJsonSync(USER_FILE, { throws: false }) || {} : {};
     res.json({ setupNeeded: Object.keys(users).length === 0 });
 });
 
@@ -133,7 +140,7 @@ app.post('/api/auth', (req, res) => {
     let users = fs.existsSync(USER_FILE) ? fs.readJsonSync(USER_FILE, { throws: false }) || {} : {};
 
     if (action === 'signup') {
-        if (Object.keys(users).length > 0) return res.json({ success: false, msg: 'Admin already exists.' });
+        if (Object.keys(users).length > 0) return res.json({ success: false, msg: 'Admin exists.' });
         users[username] = password;
         fs.writeJsonSync(USER_FILE, users);
         req.session.loggedin = true;
@@ -152,41 +159,25 @@ app.get('/api/logout', (req, res) => {
     res.redirect('/login.html');
 });
 
-// Dashboard
 app.get('/', checkAuth, (req, res) => { res.sendFile(path.join(__dirname, 'public/index.html')); });
 
-// Settings
-app.get('/api/settings', checkAuth, (req, res) => {
-    res.json(getConfig());
-});
+app.get('/api/settings', checkAuth, (req, res) => { res.json(getConfig()); });
 
 app.post('/api/settings', checkAuth, async (req, res) => {
     const newConfig = req.body;
     const oldConfig = getConfig();
     saveConfig(newConfig);
 
-    // If version changed, we need to download new jar
     if (newConfig.version !== oldConfig.version) {
-        if (serverStatus !== 'offline') {
-            stopServer();
-            // Wait for stop
-            setTimeout(async () => {
-                try {
-                    await downloadServerJar(newConfig.version);
-                    startServer();
-                } catch(e) { console.error(e); }
-            }, 3000);
-        } else {
-            try {
-                await downloadServerJar(newConfig.version);
-            } catch(e) { console.error(e); }
-        }
+        if (serverStatus !== 'offline') stopServer();
+        setTimeout(async () => {
+            try { await downloadServerJar(newConfig.version); startServer(); } 
+            catch(e) { console.error(e); }
+        }, 3000);
     }
-    
     res.json({ success: true });
 });
 
-// Plugins
 app.get('/api/plugins', checkAuth, (req, res) => {
     fs.readdir(PLUGINS_DIR, (err, files) => {
         if(err) return res.json([]);
@@ -195,79 +186,62 @@ app.get('/api/plugins', checkAuth, (req, res) => {
 });
 
 app.post('/api/plugins/upload', checkAuth, upload.single('file'), (req, res) => {
-    if(req.file) {
-        fs.moveSync(req.file.path, path.join(PLUGINS_DIR, req.file.originalname), { overwrite: true });
-    }
+    if(req.file) fs.moveSync(req.file.path, path.join(PLUGINS_DIR, req.file.originalname), { overwrite: true });
     res.redirect('/');
 });
 
 app.post('/api/plugins/install-url', checkAuth, async (req, res) => {
-    const { url } = req.body;
     try {
+        const { url } = req.body;
         const fileName = url.split('/').pop();
         const response = await axios({ url, method: 'GET', responseType: 'stream' });
         const writer = fs.createWriteStream(path.join(PLUGINS_DIR, fileName));
         response.data.pipe(writer);
         res.json({ success: true });
-    } catch(e) {
-        res.json({ success: false, msg: e.message });
-    }
+    } catch(e) { res.json({ success: false, msg: e.message }); }
 });
 
 app.post('/api/plugins/delete', checkAuth, (req, res) => {
-    try {
-        fs.removeSync(path.join(PLUGINS_DIR, req.body.filename));
-        res.json({ success: true });
-    } catch(e) { res.json({ success: false }); }
+    try { fs.removeSync(path.join(PLUGINS_DIR, req.body.filename)); res.json({ success: true }); } 
+    catch(e) { res.json({ success: false }); }
 });
 
-
 // --- SERVER CONTROL ---
-
 function startServer() {
     if (mcProcess) return;
     const config = getConfig();
 
-    // Check if jar exists, if not, try download
     if (!fs.existsSync('server.jar')) {
-        io.emit('log', '[System] server.jar not found. Downloading...');
-        downloadServerJar(config.version).then(() => startServer()).catch(err => {
-            io.emit('log', '[System] Failed to download server.');
-        });
+        io.emit('log', '[System] server.jar missing. Downloading...');
+        downloadServerJar(config.version).then(() => startServer()).catch(() => io.emit('log', '[System] Download failed.'));
         return;
     }
+    
+    // Ensure Game Port is 25565
+    ensureServerProps();
 
     serverStatus = 'starting';
     io.emit('status', serverStatus);
-    io.emit('log', `\n[System] Starting Server with ${config.ram}GB RAM...`);
+    io.emit('log', `\n[System] Starting Server (RAM: ${config.ram}GB)...`);
 
     const ramArgs = [`-Xmx${config.ram}G`, `-Xms${config.ram}G`];
-    const args = [...ramArgs, '-jar', 'server.jar', 'nogui'];
-
-    mcProcess = spawn('java', args);
+    // Start Java
+    mcProcess = spawn('java', [...ramArgs, '-jar', 'server.jar', 'nogui']);
 
     mcProcess.stdout.on('data', (data) => {
         const line = data.toString();
         logs.push(line);
-        if (logs.length > 1000) logs.shift();
+        if (logs.length > 800) logs.shift();
         io.emit('log', line);
-        if (line.includes('Done')) {
-            serverStatus = 'online';
-            io.emit('status', serverStatus);
-        }
+        if (line.includes('Done')) { serverStatus = 'online'; io.emit('status', serverStatus); }
     });
 
-    mcProcess.stderr.on('data', (data) => {
-        const line = data.toString();
-        io.emit('log', line);
-    });
+    mcProcess.stderr.on('data', (d) => io.emit('log', d.toString()));
 
     mcProcess.on('close', (code) => {
         mcProcess = null;
         serverStatus = 'offline';
-        const msg = `\n[System] Server stopped (Code ${code})\n`;
-        logs.push(msg);
-        io.emit('log', msg);
+        io.emit('log', `\n[System] Server Closed (Code ${code})\n`);
         io.emit('status', serverStatus);
     });
 }
@@ -280,41 +254,31 @@ function stopServer() {
     }
 }
 
-// --- SOCKET.IO ---
 io.on('connection', (socket) => {
     socket.emit('history', logs.join(''));
     socket.emit('status', serverStatus);
-
     socket.on('command', (cmd) => {
-        console.log('CMD:', cmd);
         if (cmd === '__start__') startServer();
         else if (cmd === '__stop__') stopServer();
-        else if (cmd === '__restart__') {
-            stopServer();
-            setTimeout(startServer, 5000);
-        }
-        else if (mcProcess && mcProcess.stdin) {
-            mcProcess.stdin.write(cmd + '\n');
-        }
+        else if (cmd === '__restart__') { stopServer(); setTimeout(startServer, 5000); }
+        else if (mcProcess) mcProcess.stdin.write(cmd + '\n');
     });
 });
 
-// Boot Check
+// Initial boot logic
 const cfg = getConfig();
-if(!fs.existsSync('server.jar')) {
-    console.log("Initial download of server jar...");
-    downloadServerJar(cfg.version);
-}
+if(!fs.existsSync('server.jar')) downloadServerJar(cfg.version);
 
-const port = process.env.PORT || 8080;
+// --- PORT FIX HERE ---
+// We listen on the PANEL_PORT (20000) for the dashboard
+const port = process.env.PANEL_PORT || 20000;
 server.listen(port, () => console.log(`Dashboard running on port ${port}`));
 EOF
 
 # --- 5. CREATE FRONTEND ---
-
 RUN mkdir public
 
-# --- LOGIN HTML ---
+# Login Page
 RUN cat << 'EOF' > public/login.html
 <!DOCTYPE html>
 <html lang="en">
@@ -324,8 +288,8 @@ RUN cat << 'EOF' > public/login.html
 <title>Admin Login</title>
 <style>
     :root { --primary: #6366f1; --bg: #0f172a; --card: #1e293b; --text: #f8fafc; }
-    body { background: var(--bg); color: var(--text); font-family: 'Segoe UI', sans-serif; display: flex; align-items: center; justify-content: center; height: 100vh; margin: 0; }
-    .card { background: var(--card); padding: 2rem; border-radius: 12px; box-shadow: 0 10px 25px rgba(0,0,0,0.5); width: 100%; max-width: 350px; text-align: center; border: 1px solid #334155; }
+    body { background: var(--bg); color: var(--text); font-family: sans-serif; display: flex; align-items: center; justify-content: center; height: 100vh; margin: 0; }
+    .card { background: var(--card); padding: 2rem; border-radius: 12px; box-shadow: 0 10px 25px rgba(0,0,0,0.5); width: 320px; text-align: center; border: 1px solid #334155; }
     h2 { margin-bottom: 1.5rem; color: var(--primary); }
     input { width: 100%; padding: 12px; margin-bottom: 10px; background: #334155; border: 1px solid #475569; color: white; border-radius: 6px; box-sizing: border-box; outline: none; }
     input:focus { border-color: var(--primary); }
@@ -367,7 +331,7 @@ RUN cat << 'EOF' > public/login.html
 </html>
 EOF
 
-# --- MAIN DASHBOARD HTML ---
+# Dashboard Page
 RUN cat << 'EOF' > public/index.html
 <!DOCTYPE html>
 <html lang="en">
@@ -384,9 +348,8 @@ RUN cat << 'EOF' > public/index.html
         --term-bg: #101012;
     }
     * { box-sizing: border-box; }
-    body { margin: 0; font-family: 'Segoe UI', system-ui, sans-serif; background: var(--bg); color: var(--text-main); display: flex; height: 100vh; overflow: hidden; }
+    body { margin: 0; font-family: system-ui, sans-serif; background: var(--bg); color: var(--text-main); display: flex; height: 100vh; overflow: hidden; }
     
-    /* Sidebar */
     .sidebar { width: 260px; background: var(--sidebar); display: flex; flex-direction: column; padding: 20px; border-right: 1px solid #3f3f46; }
     .logo { font-size: 20px; font-weight: bold; color: var(--accent); margin-bottom: 30px; display: flex; align-items: center; gap: 10px; }
     .nav-item { padding: 12px 15px; margin-bottom: 5px; border-radius: 8px; cursor: pointer; color: var(--text-muted); transition: 0.2s; display: flex; align-items: center; gap: 12px; }
@@ -395,18 +358,15 @@ RUN cat << 'EOF' > public/index.html
     .status-online { background: var(--success); box-shadow: 0 0 8px var(--success); }
     .status-offline { background: var(--danger); box-shadow: 0 0 8px var(--danger); }
     
-    /* Main Content */
     .main { flex: 1; padding: 30px; overflow-y: auto; display: flex; flex-direction: column; gap: 20px; position: relative; }
     .page { display: none; animation: fadeIn 0.3s; height: 100%; flex-direction: column; }
     .page.active { display: flex; }
     @keyframes fadeIn { from { opacity: 0; transform: translateY(5px); } to { opacity: 1; transform: translateY(0); } }
 
-    /* Header */
     .header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 20px; }
     h1 { margin: 0; font-size: 24px; }
     .actions { display: flex; gap: 10px; }
 
-    /* Buttons */
     .btn { border: none; padding: 10px 20px; border-radius: 8px; font-weight: 600; cursor: pointer; transition: 0.2s; display: flex; align-items: center; gap: 8px; }
     .btn-primary { background: var(--accent); color: white; }
     .btn-primary:hover { background: #4f46e5; }
@@ -415,13 +375,11 @@ RUN cat << 'EOF' > public/index.html
     .btn-secondary { background: var(--card); color: var(--text-main); border: 1px solid #3f3f46; }
     .btn-secondary:hover { background: #3f3f46; }
 
-    /* Terminal */
     .terminal-container { flex: 1; display: flex; flex-direction: column; background: var(--term-bg); border-radius: 12px; border: 1px solid #3f3f46; overflow: hidden; }
-    #terminal { flex: 1; padding: 15px; overflow-y: auto; font-family: 'Consolas', monospace; font-size: 13px; white-space: pre-wrap; color: #d4d4d8; }
+    #terminal { flex: 1; padding: 15px; overflow-y: auto; font-family: monospace; font-size: 13px; white-space: pre-wrap; color: #d4d4d8; }
     .cmd-bar { display: flex; padding: 10px; background: #18181b; border-top: 1px solid #3f3f46; }
     #cmdInput { flex: 1; background: transparent; border: none; color: white; outline: none; font-family: monospace; }
     
-    /* Settings Form */
     .settings-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(250px, 1fr)); gap: 20px; }
     .card-box { background: var(--card); padding: 20px; border-radius: 12px; border: 1px solid #3f3f46; }
     .form-group { margin-bottom: 15px; }
@@ -429,12 +387,10 @@ RUN cat << 'EOF' > public/index.html
     .form-control { width: 100%; padding: 12px; background: #18181b; border: 1px solid #3f3f46; border-radius: 8px; color: white; outline: none; transition: 0.2s; }
     .form-control:focus { border-color: var(--accent); }
 
-    /* Plugin List */
     .plugin-item { display: flex; justify-content: space-between; align-items: center; padding: 15px; background: #18181b; border-bottom: 1px solid #3f3f46; }
     .plugin-item:first-child { border-radius: 8px 8px 0 0; }
     .plugin-item:last-child { border-radius: 0 0 8px 8px; border-bottom: none; }
     
-    /* Log Colors */
     .log-info { color: #60a5fa; }
     .log-warn { color: #facc15; }
     .log-error { color: #f87171; }
@@ -459,8 +415,6 @@ RUN cat << 'EOF' > public/index.html
 </div>
 
 <div class="main">
-    
-    <!-- CONSOLE PAGE -->
     <div id="console" class="page active">
         <div class="header">
             <h1>Server Console</h1>
@@ -479,7 +433,6 @@ RUN cat << 'EOF' > public/index.html
         </div>
     </div>
 
-    <!-- SETTINGS PAGE -->
     <div id="settings" class="page">
         <div class="header"><h1>Server Settings</h1></div>
         <div class="settings-grid">
@@ -504,7 +457,6 @@ RUN cat << 'EOF' > public/index.html
         </div>
     </div>
 
-    <!-- PLUGINS PAGE -->
     <div id="plugins" class="page">
         <div class="header">
             <h1>Plugin Manager</h1>
@@ -513,7 +465,6 @@ RUN cat << 'EOF' > public/index.html
                 <input type="file" id="plUpload" style="display:none" onchange="uploadPlugin(this)">
             </div>
         </div>
-
         <div class="card-box" style="margin-bottom: 20px;">
             <h3>Install from URL</h3>
             <div style="display:flex; gap:10px">
@@ -521,13 +472,11 @@ RUN cat << 'EOF' > public/index.html
                 <button class="btn btn-secondary" onclick="installUrl()">Install</button>
             </div>
         </div>
-
         <div class="card-box">
             <h3>Installed Plugins</h3>
             <div id="pluginList"></div>
         </div>
     </div>
-
 </div>
 
 <script src="/socket.io/socket.io.js"></script>
@@ -536,7 +485,6 @@ RUN cat << 'EOF' > public/index.html
     const term = document.getElementById('terminal');
     let autoScroll = true;
 
-    // --- NAVIGATION ---
     function showPage(id) {
         document.querySelectorAll('.page').forEach(p => p.classList.remove('active'));
         document.querySelectorAll('.nav-item').forEach(n => n.classList.remove('active'));
@@ -546,49 +494,37 @@ RUN cat << 'EOF' > public/index.html
         if(id === 'settings') loadSettings();
     }
 
-    // --- SOCKET LOGIC ---
     socket.on('log', (msg) => {
         const span = document.createElement('div');
         if(msg.toLowerCase().includes('error')) span.className = 'log-error';
         else if(msg.toLowerCase().includes('warn')) span.className = 'log-warn';
         else if(msg.includes('[System]')) span.className = 'log-info';
-        
         span.textContent = msg;
         term.appendChild(span);
         if (autoScroll) term.scrollTop = term.scrollHeight;
     });
 
-    socket.on('history', (data) => {
-        term.textContent = data;
-        term.scrollTop = term.scrollHeight;
-    });
+    socket.on('history', (data) => { term.textContent = data; term.scrollTop = term.scrollHeight; });
 
     socket.on('status', (status) => {
         const dot = document.getElementById('statusDot');
         const text = document.getElementById('statusText');
         text.textContent = status.toUpperCase();
-        dot.className = 'status-dot'; // reset
+        dot.className = 'status-dot';
         if(status === 'online') dot.classList.add('status-online');
         else if(status === 'offline') dot.classList.add('status-offline');
-        else dot.style.background = '#facc15'; // starting/stopping yellow
+        else dot.style.background = '#facc15';
     });
 
-    // --- CONSOLE INPUT ---
     document.getElementById('cmdInput').addEventListener('keydown', (e) => {
         if(e.key === 'Enter') {
             const cmd = e.target.value;
-            if(cmd) {
-                socket.emit('command', cmd);
-                e.target.value = '';
-            }
+            if(cmd) { socket.emit('command', cmd); e.target.value = ''; }
         }
     });
 
-    term.addEventListener('scroll', () => {
-        autoScroll = (term.scrollTop + term.clientHeight >= term.scrollHeight - 20);
-    });
+    term.addEventListener('scroll', () => { autoScroll = (term.scrollTop + term.clientHeight >= term.scrollHeight - 20); });
 
-    // --- SETTINGS ---
     function loadSettings() {
         fetch('/api/settings').then(r=>r.json()).then(data => {
             document.getElementById('ramInput').value = data.ram;
@@ -600,15 +536,13 @@ RUN cat << 'EOF' > public/index.html
         const ram = document.getElementById('ramInput').value;
         const version = document.getElementById('versionInput').value;
         fetch('/api/settings', {
-            method: 'POST',
-            headers: {'Content-Type': 'application/json'},
+            method: 'POST', headers: {'Content-Type': 'application/json'},
             body: JSON.stringify({ ram, version })
         }).then(r=>r.json()).then(d => {
-            if(d.success) alert('Settings saved! Server may restart if version changed.');
+            if(d.success) alert('Settings saved! Server may restart.');
         });
     }
 
-    // --- PLUGINS ---
     function loadPlugins() {
         fetch('/api/plugins').then(r=>r.json()).then(files => {
             const list = document.getElementById('pluginList');
@@ -628,41 +562,31 @@ RUN cat << 'EOF' > public/index.html
         if(!input.files[0]) return;
         const fd = new FormData();
         fd.append('file', input.files[0]);
-        fetch('/api/plugins/upload', { method: 'POST', body: fd }).then(() => {
-            loadPlugins();
-            alert('Plugin uploaded! Restart server to apply.');
-        });
+        fetch('/api/plugins/upload', { method: 'POST', body: fd }).then(() => { loadPlugins(); alert('Plugin uploaded!'); });
     }
 
     function installUrl() {
         const url = document.getElementById('urlInput').value;
         if(!url) return;
         fetch('/api/plugins/install-url', {
-            method: 'POST',
-            headers: {'Content-Type': 'application/json'},
-            body: JSON.stringify({ url })
-        }).then(r=>r.json()).then(d => {
-            if(d.success) { loadPlugins(); alert('Plugin installed!'); }
-            else alert('Error: ' + d.msg);
-        });
+            method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({ url })
+        }).then(r=>r.json()).then(d => { if(d.success) { loadPlugins(); alert('Plugin installed!'); } else alert('Error: ' + d.msg); });
     }
 
     function deletePlugin(filename) {
         if(!confirm('Delete ' + filename + '?')) return;
         fetch('/api/plugins/delete', {
-            method: 'POST',
-            headers: {'Content-Type': 'application/json'},
-            body: JSON.stringify({ filename })
+            method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({ filename })
         }).then(() => loadPlugins());
     }
-
 </script>
 </body>
 </html>
 EOF
 
 # --- 6. EXPOSE PORTS ---
-EXPOSE 8080 25565
+# 20000 = Web Panel, 25565 = Minecraft Game
+EXPOSE 20000 25565
 
 # --- 7. START ---
 CMD ["node", "server.js"]
