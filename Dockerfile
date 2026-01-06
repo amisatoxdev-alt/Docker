@@ -5,7 +5,7 @@ ENV DEBIAN_FRONTEND=noninteractive
 ENV PORT=8080
 
 # --- 2. INSTALL DEPENDENCIES ---
-# Install Java 21 (Required for MC 1.20+), Node.js, and Zip tools
+# Java 21 (Latest MC), Node.js, Curl, Wget, Zip
 RUN apt-get update && apt-get install -y \
     curl wget git tar sudo unzip zip \
     openjdk-21-jre-headless \
@@ -18,16 +18,16 @@ RUN curl -fsSL https://deb.nodesource.com/setup_20.x | bash - \
 # --- 3. SETUP APP DIRECTORY ---
 WORKDIR /app
 
-# Install Node Libraries
+# Initialize & Install Modules
 RUN npm init -y && \
-    npm install express socket.io multer fs-extra body-parser express-session adm-zip
+    npm install express socket.io multer fs-extra body-parser express-session adm-zip axios
 
-# Download Minecraft Server (Paper 1.20.4)
-RUN wget -O server.jar https://api.papermc.io/v2/projects/paper/versions/1.20.4/builds/496/downloads/paper-1.20.4-496.jar
+# Default Config & EULA
 RUN echo "eula=true" > eula.txt
+# Create a config file for RAM and JAR settings
+RUN echo '{"ram": "2G", "jar": "server.jar"}' > settings.json
 
-# --- 4. CREATE BACKEND (server.js) ---
-# We use 'cat' instead of 'echo' to prevent syntax errors
+# --- 4. BACKEND CODE (server.js) ---
 RUN cat << 'EOF' > server.js
 const express = require('express');
 const http = require('http');
@@ -39,325 +39,462 @@ const session = require('express-session');
 const bodyParser = require('body-parser');
 const multer = require('multer');
 const AdmZip = require('adm-zip');
+const axios = require('axios');
 
 const app = express();
 const server = http.createServer(app);
 const io = new Server(server);
-const upload = multer({ dest: 'uploads/' });
+const upload = multer({ dest: 'temp_uploads/' });
 
-const USER_FILE = 'users.json';
+// --- STATE ---
+const SETTINGS_FILE = 'settings.json';
+const USERS_FILE = 'users.json';
 let mcProcess = null;
-let logs = [];
+let consoleLog = [];
 
+// --- MIDDLEWARE ---
 app.use(express.static('public'));
 app.use(bodyParser.json());
-app.use(bodyParser.urlencoded({ extended: true }));
-app.use(session({ secret: 'railway-secret', resave: false, saveUninitialized: true }));
+app.use(session({ secret: 'supersecret', resave: false, saveUninitialized: true }));
 
-// --- AUTH MIDDLEWARE ---
-function checkAuth(req, res, next) {
-    if (req.session.loggedin) next();
-    else res.redirect('/login.html');
+// --- HELPERS ---
+function getSettings() {
+    if (!fs.existsSync(SETTINGS_FILE)) fs.writeJsonSync(SETTINGS_FILE, { ram: "1G", jar: "server.jar" });
+    return fs.readJsonSync(SETTINGS_FILE);
 }
 
-// --- API ROUTES ---
+function saveSettings(data) {
+    const current = getSettings();
+    fs.writeJsonSync(SETTINGS_FILE, { ...current, ...data });
+}
 
-// Login / Signup Logic
+function checkAuth(req, res, next) {
+    if (req.session.loggedin) next();
+    else res.status(403).json({ error: 'Not logged in' });
+}
+
+// --- ROUTES ---
+
+// 1. Auth (Login/Signup)
 app.post('/api/auth', (req, res) => {
-    const { username, password, action } = req.body;
+    const { username, password } = req.body;
     let users = {};
-    if (fs.existsSync(USER_FILE)) users = fs.readJsonSync(USER_FILE, { throws: false }) || {};
+    if (fs.existsSync(USERS_FILE)) users = fs.readJsonSync(USERS_FILE, { throws: false }) || {};
     
-    if (action === 'signup') {
-        if (Object.keys(users).length > 0) return res.json({ success: false, msg: 'Admin account already exists.' });
+    // First time signup
+    if (Object.keys(users).length === 0) {
         users[username] = password;
-        fs.writeJsonSync(USER_FILE, users);
+        fs.writeJsonSync(USERS_FILE, users);
+        req.session.loggedin = true;
+        return res.json({ success: true, msg: 'Admin Created' });
+    }
+    
+    if (users[username] && users[username] === password) {
         req.session.loggedin = true;
         return res.json({ success: true });
-    } else {
-        if (users[username] && users[username] === password) {
-            req.session.loggedin = true;
-            return res.json({ success: true });
-        }
-        return res.json({ success: false, msg: 'Invalid credentials' });
     }
+    res.json({ success: false, msg: 'Invalid Credentials' });
 });
 
 app.get('/api/check-setup', (req, res) => {
-    let users = {};
-    if (fs.existsSync(USER_FILE)) users = fs.readJsonSync(USER_FILE, { throws: false }) || {};
+    const users = fs.existsSync(USERS_FILE) ? fs.readJsonSync(USERS_FILE, { throws: false }) || {} : {};
     res.json({ setupNeeded: Object.keys(users).length === 0 });
 });
 
-// Dashboard Route
-app.get('/', checkAuth, (req, res) => {
-    res.sendFile(path.join(__dirname, 'public/index.html'));
-});
-
-// File Manager: List Files
-app.get('/api/files', checkAuth, (req, res) => {
-    const dir = req.query.path || '.';
-    const safePath = path.resolve(__dirname, dir);
-    if (!safePath.startsWith(__dirname)) return res.status(403).send('Access denied');
+// 2. Server Control
+app.post('/api/start', checkAuth, (req, res) => {
+    if (mcProcess) return res.json({ msg: 'Server already running' });
     
-    fs.readdir(safePath, { withFileTypes: true }, (err, files) => {
-        if (err) return res.json([]);
-        const result = files.map(f => ({ name: f.name, isDir: f.isDirectory() }));
-        res.json(result);
-    });
-});
-
-// File Manager: Upload Zip
-app.post('/api/upload', checkAuth, upload.single('file'), (req, res) => {
-    const targetPath = req.body.path || '.';
-    if (req.file && req.file.originalname.endsWith('.zip')) {
-        try {
-            const zip = new AdmZip(req.file.path);
-            zip.extractAllTo(path.join(__dirname, targetPath), true);
-            fs.unlinkSync(req.file.path);
-        } catch (e) { console.error(e); }
-    } else if (req.file) {
-        fs.moveSync(req.file.path, path.join(__dirname, targetPath, req.file.originalname), { overwrite: true });
-    }
-    res.redirect('/');
-});
-
-// --- MINECRAFT SERVER LOGIC ---
-function startServer() {
-    if (mcProcess) return;
-    console.log('Starting Minecraft Server...');
+    const settings = getSettings();
+    const ram = settings.ram || "1G";
+    const jar = settings.jar || "server.jar";
     
-    // Memory Limit: 1GB (Adjust based on your Railway plan)
-    mcProcess = spawn('java', ['-Xmx1G', '-Xms1G', '-jar', 'server.jar', 'nogui']);
+    if (!fs.existsSync(jar)) return res.json({ msg: 'Server JAR not found! Go to Settings to install one.' });
+
+    io.emit('log', `\n>>> STARTING SERVER (${ram} RAM, ${jar})...\n`);
     
-    mcProcess.stdout.on('data', (data) => {
-        const line = data.toString();
-        logs.push(line);
-        if (logs.length > 500) logs.shift();
+    mcProcess = spawn('java', [`-Xmx${ram}`, `-Xms${ram}`, '-jar', jar, 'nogui']);
+    
+    mcProcess.stdout.on('data', d => {
+        const line = d.toString();
+        consoleLog.push(line);
+        if (consoleLog.length > 500) consoleLog.shift();
         io.emit('log', line);
         process.stdout.write(line);
     });
     
-    mcProcess.stderr.on('data', (data) => {
-        const line = data.toString();
+    mcProcess.stderr.on('data', d => {
+        const line = d.toString();
         io.emit('log', line);
         process.stdout.write(line);
     });
     
     mcProcess.on('close', () => {
         mcProcess = null;
-        const msg = '\n--- SERVER STOPPED ---\n';
-        logs.push(msg);
-        io.emit('log', msg);
+        io.emit('log', '\n>>> SERVER STOPPED <<<\n');
+        io.emit('status', 'stopped');
     });
-}
-
-// --- WEBSOCKET FOR TERMINAL ---
-io.on('connection', (socket) => {
-    socket.emit('history', logs.join(''));
     
-    socket.on('command', (cmd) => {
-        console.log('Web Command:', cmd);
-        if (cmd === 'start') {
-            startServer();
-        } else if (cmd === 'stop' && mcProcess) {
-            mcProcess.stdin.write('stop\n');
-        } else if (mcProcess && mcProcess.stdin) {
-            mcProcess.stdin.write(cmd + '\n');
-        }
+    io.emit('status', 'running');
+    res.json({ success: true });
+});
+
+app.post('/api/stop', checkAuth, (req, res) => {
+    if (mcProcess) {
+        mcProcess.stdin.write("stop\n");
+        res.json({ success: true });
+    } else {
+        res.json({ msg: 'Server not running' });
+    }
+});
+
+// 3. Settings (RAM & Version)
+app.get('/api/settings', checkAuth, (req, res) => res.json(getSettings()));
+app.post('/api/settings', checkAuth, (req, res) => {
+    saveSettings(req.body);
+    res.json({ success: true });
+});
+
+// 4. Installer (Version & Plugins)
+app.post('/api/install', checkAuth, async (req, res) => {
+    const { url, type, filename } = req.body; // type = 'jar' or 'plugin'
+    const targetDir = type === 'plugin' ? 'plugins' : '.';
+    fs.ensureDirSync(targetDir);
+    const targetPath = path.join(targetDir, filename);
+    
+    try {
+        io.emit('log', `\n>>> DOWNLOADING ${filename}...\n`);
+        const response = await axios({ method: 'get', url: url, responseType: 'stream' });
+        const writer = fs.createWriteStream(targetPath);
+        response.data.pipe(writer);
+        
+        writer.on('finish', () => {
+            io.emit('log', `>>> INSTALLED ${filename} SUCCESSFULLY!\n`);
+            if (type === 'jar') saveSettings({ jar: filename });
+            res.json({ success: true });
+        });
+    } catch (err) {
+        io.emit('log', `>>> ERROR DOWNLOADING: ${err.message}\n`);
+        res.json({ success: false, msg: err.message });
+    }
+});
+
+// 5. File Manager
+app.get('/api/files', checkAuth, (req, res) => {
+    const dir = req.query.path || '.';
+    if(dir.includes('..')) return res.json([]); 
+    fs.readdir(path.join(__dirname, dir), { withFileTypes: true }, (err, files) => {
+        if (err) return res.json([]);
+        res.json(files.map(f => ({ name: f.name, isDir: f.isDirectory() })));
     });
 });
 
-// Start Server on Boot
-startServer();
+app.post('/api/upload', checkAuth, upload.single('file'), (req, res) => {
+    if (req.file) {
+        if (req.file.originalname.endsWith('.zip')) {
+            try {
+                const zip = new AdmZip(req.file.path);
+                zip.extractAllTo('.', true); // Extract to root
+            } catch(e) { console.error(e); }
+        } else {
+            fs.moveSync(req.file.path, path.join('.', req.file.originalname), { overwrite: true });
+        }
+        fs.removeSync(req.file.path); // Cleanup temp
+    }
+    res.redirect('/');
+});
+
+// --- SOCKET IO ---
+io.on('connection', (socket) => {
+    socket.emit('history', consoleLog.join(''));
+    socket.emit('status', mcProcess ? 'running' : 'stopped');
+    socket.on('command', (cmd) => {
+        if (mcProcess) mcProcess.stdin.write(cmd + "\n");
+    });
+});
 
 const port = process.env.PORT || 8080;
-server.listen(port, () => console.log('Panel running on port ' + port));
+server.listen(port, () => console.log(`PANEL RUNNING ON ${port}`));
 EOF
 
-# --- 5. CREATE FRONTEND FILES ---
+# --- 5. FRONTEND FILES (HTML/CSS/JS) ---
 RUN mkdir public
 
-# Create Login HTML
-RUN cat << 'EOF' > public/login.html
-<!DOCTYPE html>
-<html>
-<head>
-    <title>Panel Login</title>
-    <meta name="viewport" content="width=device-width, initial-scale=1">
-    <style>
-        body{background:#111;color:#eee;font-family:sans-serif;display:flex;justify-content:center;align-items:center;height:100vh;margin:0}
-        form{background:#222;padding:30px;border-radius:10px;box-shadow:0 0 10px rgba(0,0,0,0.5);width:300px}
-        input{display:block;margin:15px 0;padding:10px;width:100%;box-sizing:border-box;background:#333;border:1px solid #444;color:white;border-radius:5px}
-        button{width:100%;padding:10px;background:#007bff;color:white;border:none;border-radius:5px;cursor:pointer;font-weight:bold}
-        button:hover{background:#0056b3}
-        h2{text-align:center;margin-top:0}
-    </style>
-</head>
-<body>
-<form id='authForm'>
-    <h2 id='title'>Login</h2>
-    <input type='text' id='user' placeholder='Username' required>
-    <input type='password' id='pass' placeholder='Password' required>
-    <button type='submit'>Submit</button>
-</form>
-<script>
-    fetch('/api/check-setup').then(r=>r.json()).then(d => {
-        if(d.setupNeeded) {
-            document.getElementById('title').innerText = 'Setup Admin Account';
-            document.getElementById('authForm').dataset.action = 'signup';
-        }
-    });
-    document.getElementById('authForm').onsubmit = async (e) => {
-        e.preventDefault();
-        const user = document.getElementById('user').value;
-        const pass = document.getElementById('pass').value;
-        const action = e.target.dataset.action || 'login';
-        const res = await fetch('/api/auth', {
-            method: 'POST', headers:{'Content-Type':'application/json'},
-            body: JSON.stringify({username:user, password:pass, action})
-        });
-        const data = await res.json();
-        if(data.success) location.href = '/';
-        else alert(data.msg);
-    };
-</script>
-</body>
-</html>
-EOF
-
-# Create Dashboard HTML
+# --- INDEX.HTML (THE UI) ---
 RUN cat << 'EOF' > public/index.html
 <!DOCTYPE html>
-<html>
+<html lang="en">
 <head>
-    <title>MC Control Panel</title>
-    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Railway MC Panel</title>
+    <link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0/css/all.min.css" rel="stylesheet">
     <style>
-        body { background: #111; color: #eee; font-family: monospace; display: grid; grid-template-columns: 260px 1fr; gap: 10px; height: 98vh; margin: 0; padding: 10px; }
-        .sidebar { background: #1e1e1e; padding: 15px; border-radius: 8px; display: flex; flex-direction: column; gap: 12px; border: 1px solid #333; }
-        .main { display: flex; flex-direction: column; gap: 10px; }
-        .terminal { flex: 1; background: #000; padding: 15px; overflow-y: auto; white-space: pre-wrap; font-size: 13px; border-radius: 8px; border: 1px solid #333; font-family: 'Consolas', monospace; }
-        .controls { display: grid; grid-template-columns: repeat(2, 1fr); gap: 8px; }
-        button, .file-btn { padding: 10px; background: #333; color: white; border: 1px solid #444; border-radius: 5px; cursor: pointer; text-align:center; transition:0.2s; }
-        button:hover { background: #444; border-color: #666; }
-        .btn-green { background: #198754; border-color: #198754; } .btn-green:hover { background: #157347; }
-        .btn-red { background: #dc3545; border-color: #dc3545; } .btn-red:hover { background: #bb2d3b; }
-        input { padding: 10px; background: #222; color: white; border: 1px solid #444; border-radius: 5px; width: 100%; box-sizing: border-box; }
-        #file-list { margin-top:10px; overflow-y:auto; height: 250px; background:#111; border:1px solid #333; border-radius:5px; }
-        .file-item { padding: 8px; cursor: pointer; border-bottom: 1px solid #222; font-size:12px; display:flex; align-items:center; }
-        .file-item:hover { background: #222; }
-        h3 { margin: 0 0 5px 0; font-size: 16px; color: #aaa; text-transform:uppercase; letter-spacing:1px; border-bottom:1px solid #333; padding-bottom:5px; }
+        :root { --bg: #121212; --panel: #1e1e1e; --accent: #6200ea; --text: #e0e0e0; --red: #cf6679; --green: #03dac6; }
+        body { margin: 0; font-family: 'Segoe UI', sans-serif; background: var(--bg); color: var(--text); display: flex; height: 100vh; overflow: hidden; }
         
-        /* Mobile Layout */
-        @media (max-width: 768px) {
-            body { grid-template-columns: 1fr; grid-template-rows: auto 1fr; }
-            .sidebar { height: auto; max-height: 300px; overflow-y: auto; }
-        }
+        /* Sidebar */
+        .sidebar { width: 250px; background: var(--panel); display: flex; flex-direction: column; padding: 20px; box-shadow: 2px 0 10px rgba(0,0,0,0.5); }
+        .sidebar h2 { margin: 0 0 20px 0; color: var(--accent); letter-spacing: 1px; }
+        .nav-btn { background: transparent; border: none; color: #888; padding: 15px; text-align: left; cursor: pointer; font-size: 16px; border-radius: 8px; transition: 0.2s; display: flex; align-items: center; gap: 10px; }
+        .nav-btn:hover, .nav-btn.active { background: #333; color: white; }
+        .nav-btn i { width: 20px; }
+        
+        /* Main Content */
+        .main { flex: 1; padding: 20px; display: flex; flex-direction: column; gap: 20px; overflow-y: auto; }
+        .card { background: var(--panel); padding: 20px; border-radius: 12px; border: 1px solid #333; }
+        h3 { margin-top: 0; border-bottom: 1px solid #333; padding-bottom: 10px; }
+
+        /* Terminal */
+        #terminal { background: #000; height: 400px; overflow-y: auto; padding: 15px; font-family: monospace; white-space: pre-wrap; font-size: 13px; color: #ccc; border-radius: 8px; border: 1px solid #333; }
+        .input-group { display: flex; gap: 10px; margin-top: 10px; }
+        input[type="text"], select { flex: 1; padding: 12px; border-radius: 6px; border: 1px solid #444; background: #222; color: white; outline: none; }
+        
+        /* Buttons */
+        .btn { padding: 10px 20px; border: none; border-radius: 6px; cursor: pointer; font-weight: bold; transition: 0.2s; }
+        .btn-primary { background: var(--accent); color: white; }
+        .btn-success { background: var(--green); color: black; }
+        .btn-danger { background: var(--red); color: black; }
+        .btn:hover { opacity: 0.9; transform: translateY(-1px); }
+        .status-badge { padding: 5px 10px; border-radius: 4px; font-size: 12px; font-weight: bold; text-transform: uppercase; }
+        .status-running { background: rgba(3, 218, 198, 0.2); color: var(--green); }
+        .status-stopped { background: rgba(207, 102, 121, 0.2); color: var(--red); }
+
+        /* File List */
+        .file-item { display: flex; justify-content: space-between; padding: 10px; border-bottom: 1px solid #333; cursor: pointer; }
+        .file-item:hover { background: #2a2a2a; }
+
+        /* Sections */
+        .section { display: none; }
+        .section.active { display: block; }
+        
+        /* Login Overlay */
+        #login-overlay { position: fixed; top:0; left:0; width:100%; height:100%; background: var(--bg); z-index: 999; display: flex; justify-content: center; align-items: center; }
+        .login-box { background: var(--panel); padding: 40px; border-radius: 12px; width: 300px; text-align: center; }
     </style>
 </head>
 <body>
-    <div class='sidebar'>
-        <h3>Server Controls</h3>
-        <div class='controls'>
-            <button class='btn-green' onclick="cmd('start')">START</button>
-            <button class='btn-red' onclick="cmd('stop')">STOP</button>
-        </div>
-        
-        <h3>Game Settings</h3>
-        <div class='controls'>
-            <button onclick="cmd('gamemode creative @a')">Creative</button>
-            <button onclick="cmd('gamemode survival @a')">Survival</button>
-            <button onclick="cmd('time set day')">Day</button>
-            <button onclick="cmd('time set night')">Night</button>
-        </div>
 
-        <h3>Player Manager</h3>
-        <input id='targetPlayer' placeholder='Player Name'>
-        <div class='controls'>
-            <button class='btn-red' onclick="action('ban')">Ban</button>
-            <button class='btn-green' onclick="action('op')">OP</button>
-            <button onclick="action('kick')">Kick</button>
-            <button onclick="action('pardon')">Unban</button>
-        </div>
+<div id="login-overlay">
+    <div class="login-box">
+        <h2 id="login-title">Admin Login</h2>
+        <input type="text" id="username" placeholder="Username" style="margin-bottom: 10px;">
+        <input type="password" id="password" placeholder="Password" style="margin-bottom: 20px;">
+        <button class="btn btn-primary" style="width:100%" onclick="login()">Enter Panel</button>
+    </div>
+</div>
 
-        <h3>File Upload (Zip)</h3>
-        <form action='/api/upload' method='post' enctype='multipart/form-data' style="display:flex; flex-direction:column; gap:5px;">
-            <input type='file' name='file' required style="font-size:12px">
-            <button type='submit' class='btn-green'>Upload & Unzip</button>
-        </form>
-        <div id='file-list'></div>
+<div class="sidebar">
+    <h2><i class="fa-solid fa-cube"></i> MC PANEL</h2>
+    <button class="nav-btn active" onclick="show('console')"><i class="fa-solid fa-terminal"></i> Console</button>
+    <button class="nav-btn" onclick="show('controls')"><i class="fa-solid fa-gamepad"></i> Game Controls</button>
+    <button class="nav-btn" onclick="show('files')"><i class="fa-solid fa-folder"></i> File Manager</button>
+    <button class="nav-btn" onclick="show('settings')"><i class="fa-solid fa-gear"></i> Settings</button>
+</div>
+
+<div class="main">
+    
+    <div id="console" class="section active">
+        <div class="card">
+            <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:10px;">
+                <h3>Server Console</h3>
+                <span id="status-badge" class="status-badge status-stopped">STOPPED</span>
+            </div>
+            <div id="terminal"></div>
+            <div class="input-group">
+                <input type="text" id="cmdInput" placeholder="Type command (e.g., op player, gamemode creative)...">
+                <button class="btn btn-primary" onclick="sendCmd()">Send</button>
+            </div>
+            <div style="margin-top: 15px; display:flex; gap: 10px;">
+                <button class="btn btn-success" onclick="api('start')"><i class="fa-solid fa-play"></i> START</button>
+                <button class="btn btn-danger" onclick="api('stop')"><i class="fa-solid fa-stop"></i> STOP</button>
+            </div>
+        </div>
     </div>
 
-    <div class='main'>
-        <div class='terminal' id='term'></div>
-        <div style='display:flex; gap:10px'>
-            <input id='cmdInput' style='flex:1' placeholder='Type a command...' autocomplete="off">
-            <button onclick='send()' class='btn-green' style="width:100px">Send</button>
+    <div id="controls" class="section">
+        <div class="card">
+            <h3>Quick Actions</h3>
+            <div style="display:grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 10px;">
+                <button class="btn btn-primary" onclick="send('time set day')">Time Day</button>
+                <button class="btn btn-primary" onclick="send('time set night')">Time Night</button>
+                <button class="btn btn-primary" onclick="send('weather clear')">Clear Weather</button>
+                <button class="btn btn-primary" onclick="send('gamerule keepInventory true')">Keep Inventory</button>
+            </div>
+        </div>
+        <div class="card" style="margin-top:20px;">
+            <h3>Player Management</h3>
+            <div class="input-group">
+                <input type="text" id="targetPlayer" placeholder="Player Name">
+            </div>
+            <div style="margin-top:10px; display:flex; gap:10px;">
+                <button class="btn btn-success" onclick="playerAction('op')">OP</button>
+                <button class="btn btn-danger" onclick="playerAction('ban')">BAN</button>
+                <button class="btn btn-danger" onclick="playerAction('kick')">KICK</button>
+                <button class="btn btn-primary" onclick="playerAction('gamemode creative')">CREATIVE</button>
+                <button class="btn btn-primary" onclick="playerAction('gamemode survival')">SURVIVAL</button>
+            </div>
         </div>
     </div>
 
-<script src='/socket.io/socket.io.js'></script>
+    <div id="files" class="section">
+        <div class="card">
+            <h3>Upload Map / Plugins</h3>
+            <form action="/api/upload" method="post" enctype="multipart/form-data" class="input-group">
+                <input type="file" name="file" required>
+                <button class="btn btn-success">Upload</button>
+            </form>
+            <small>Supports .zip (auto-extracts) and .jar</small>
+        </div>
+        <div class="card" style="margin-top:20px;">
+            <h3>File Browser</h3>
+            <div id="file-list"></div>
+        </div>
+    </div>
+
+    <div id="settings" class="section">
+        <div class="card">
+            <h3>Server Configuration</h3>
+            <label>Max RAM Allocation</label>
+            <div class="input-group">
+                <select id="ramSelect">
+                    <option value="1G">1 GB</option>
+                    <option value="2G">2 GB</option>
+                    <option value="4G">4 GB</option>
+                    <option value="8G">8 GB</option>
+                </select>
+                <button class="btn btn-primary" onclick="saveSettings()">Save RAM</button>
+            </div>
+        </div>
+
+        <div class="card" style="margin-top:20px;">
+            <h3>Version Installer</h3>
+            <p>Click to install a new server version (Will overwrite server.jar!).</p>
+            <div style="display:flex; gap:10px; flex-wrap:wrap;">
+                <button class="btn btn-primary" onclick="install('jar', 'https://api.papermc.io/v2/projects/paper/versions/1.20.4/builds/496/downloads/paper-1.20.4-496.jar', 'server.jar')">Install 1.20.4</button>
+                <button class="btn btn-primary" onclick="install('jar', 'https://api.papermc.io/v2/projects/paper/versions/1.21/builds/130/downloads/paper-1.21-130.jar', 'server.jar')">Install 1.21</button>
+            </div>
+        </div>
+
+        <div class="card" style="margin-top:20px;">
+            <h3>Plugin Installer</h3>
+            <div class="input-group">
+                <input type="text" id="pluginUrl" placeholder="Direct Download URL (must end in .jar)">
+                <input type="text" id="pluginName" placeholder="Filename (e.g. Essentials.jar)">
+                <button class="btn btn-success" onclick="installPlugin()">Install</button>
+            </div>
+        </div>
+    </div>
+
+</div>
+
+<script src="/socket.io/socket.io.js"></script>
 <script>
     const socket = io();
-    const term = document.getElementById('term');
+    const term = document.getElementById('terminal');
     
-    // Auto-scroll logic
-    let isScrolledToBottom = true;
-    term.addEventListener('scroll', () => {
-        isScrolledToBottom = (term.scrollHeight - term.scrollTop <= term.clientHeight + 50);
+    // --- LOGIN ---
+    fetch('/api/check-setup').then(r=>r.json()).then(d => {
+        if(d.setupNeeded) document.getElementById('login-title').innerText = 'Create Admin Account';
     });
 
+    async function login() {
+        const u = document.getElementById('username').value;
+        const p = document.getElementById('password').value;
+        const res = await fetch('/api/auth', { 
+            method:'POST', headers:{'Content-Type':'application/json'}, 
+            body: JSON.stringify({username:u, password:p}) 
+        });
+        const data = await res.json();
+        if(data.success) {
+            document.getElementById('login-overlay').style.display = 'none';
+            loadFiles();
+            loadSettings();
+        } else alert(data.msg);
+    }
+
+    // --- NAVIGATION ---
+    function show(id) {
+        document.querySelectorAll('.section').forEach(el => el.classList.remove('active'));
+        document.getElementById(id).classList.add('active');
+        document.querySelectorAll('.nav-btn').forEach(el => el.classList.remove('active'));
+        event.currentTarget.classList.add('active');
+    }
+
+    // --- TERMINAL & SOCKET ---
     socket.on('log', msg => {
-        const l = document.createElement('div');
-        l.textContent = msg;
-        term.appendChild(l);
-        if (isScrolledToBottom) term.scrollTop = term.scrollHeight;
-    });
-
-    socket.on('history', msg => {
-        term.textContent = msg;
+        const div = document.createElement('div'); div.textContent = msg;
+        term.appendChild(div);
         term.scrollTop = term.scrollHeight;
     });
-
-    function cmd(c) { socket.emit('command', c); }
-    
-    function send() {
-        const i = document.getElementById('cmdInput');
-        if(i.value) { cmd(i.value); i.value=''; }
-    }
-    
-    document.getElementById('cmdInput').addEventListener('keypress', (e) => {
-        if (e.key === 'Enter') send();
+    socket.on('status', s => {
+        const b = document.getElementById('status-badge');
+        b.className = 'status-badge status-' + s;
+        b.innerText = s.toUpperCase();
     });
 
-    function action(act) {
+    function sendCmd() {
+        const i = document.getElementById('cmdInput');
+        if(i.value) { socket.emit('command', i.value); i.value = ''; }
+    }
+    // Allow Enter key
+    document.getElementById('cmdInput').addEventListener('keypress', e => { if(e.key === 'Enter') sendCmd(); });
+
+    // --- CONTROLS ---
+    function api(action) { fetch('/api/' + action, { method: 'POST' }); }
+    function send(cmd) { socket.emit('command', cmd); }
+    function playerAction(act) {
         const p = document.getElementById('targetPlayer').value;
-        if(p) cmd(act + ' ' + p); 
-        else alert('Please enter a player name first!');
+        if(p) send(act + ' ' + p); else alert('Enter player name');
     }
 
-    // File Browser
-    function loadFiles(path = '.') {
-        fetch('/api/files?path=' + path).then(r=>r.json()).then(files => {
-            const list = document.getElementById('file-list');
-            list.innerHTML = '';
-            files.forEach(f => {
-                const item = document.createElement('div');
-                item.className = 'file-item';
-                item.textContent = (f.isDir ? '📁 ' : '📄 ') + f.name;
-                list.appendChild(item);
-            });
+    // --- SETTINGS & INSTALLER ---
+    async function loadSettings() {
+        const res = await fetch('/api/settings');
+        const data = await res.json();
+        if(data.ram) document.getElementById('ramSelect').value = data.ram;
+    }
+    async function saveSettings() {
+        const ram = document.getElementById('ramSelect').value;
+        await fetch('/api/settings', {
+            method:'POST', headers:{'Content-Type':'application/json'},
+            body: JSON.stringify({ram})
+        });
+        alert('Saved! Restart server to apply.');
+    }
+    async function install(type, url, filename) {
+        if(!confirm('This will download file and might overwrite existing ones. Continue?')) return;
+        alert('Download started in background. Check Console.');
+        fetch('/api/install', {
+            method:'POST', headers:{'Content-Type':'application/json'},
+            body: JSON.stringify({type, url, filename})
+        });
+        show('console');
+    }
+    function installPlugin() {
+        const url = document.getElementById('pluginUrl').value;
+        const name = document.getElementById('pluginName').value;
+        if(url && name) install('plugin', url, name);
+    }
+
+    // --- FILES ---
+    async function loadFiles() {
+        const res = await fetch('/api/files');
+        const files = await res.json();
+        const list = document.getElementById('file-list');
+        list.innerHTML = '';
+        files.forEach(f => {
+            const d = document.createElement('div');
+            d.className = 'file-item';
+            d.innerHTML = `<span>${f.isDir ? '📁' : '📄'} ${f.name}</span>`;
+            list.appendChild(d);
         });
     }
-    loadFiles();
 </script>
 </body>
 </html>
 EOF
 
-# --- 6. EXPOSE PORTS ---
+# --- 6. START COMMAND ---
 EXPOSE 8080 25565
-
-# --- 7. START ---
 CMD ["node", "server.js"]
