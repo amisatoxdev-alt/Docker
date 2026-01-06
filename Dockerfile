@@ -17,14 +17,14 @@ RUN curl -fsSL https://deb.nodesource.com/setup_20.x | bash - \
 # --- 3. SETUP APP DIRECTORY ---
 WORKDIR /app
 
-# Initialize Node and install dependencies
+# Initialize Node
 RUN npm init -y && \
     npm install express socket.io multer fs-extra body-parser express-session adm-zip axios
 
-# Accept EULA
+# EULA
 RUN echo "eula=true" > eula.txt
 
-# --- 4. CREATE BACKEND (server.js) ---
+# --- 4. BACKEND CODE (server.js) ---
 RUN cat << 'EOF' > server.js
 const express = require('express');
 const http = require('http');
@@ -43,25 +43,19 @@ const server = http.createServer(app);
 const io = new Server(server);
 const upload = multer({ dest: 'temp_uploads/' });
 
-// --- CONSTANTS ---
+// --- FILES ---
 const USER_FILE = 'users.json';
 const CONFIG_FILE = 'server_config.json';
 const PROPS_FILE = 'server.properties';
 const PLUGINS_DIR = 'plugins';
 
-// Default Config
-const DEFAULT_CONFIG = {
-    ram: "4",
-    version: "1.20.4"
-};
-
-let mcProcess = null;
-let logs = [];
-let serverStatus = 'offline';
-
+// Ensure Directories
 fs.ensureDirSync(PLUGINS_DIR);
+fs.ensureDirSync('views'); 
+fs.ensureDirSync('public');
 
-// --- HELPERS ---
+// --- CONFIG ---
+const DEFAULT_CONFIG = { ram: "4", version: "1.20.4" };
 
 function getConfig() {
     if (!fs.existsSync(CONFIG_FILE)) fs.writeJsonSync(CONFIG_FILE, DEFAULT_CONFIG);
@@ -72,36 +66,37 @@ function saveConfig(cfg) {
     fs.writeJsonSync(CONFIG_FILE, cfg);
 }
 
-// Read server.properties to get current render distance
-function getProperties() {
-    if (!fs.existsSync(PROPS_FILE)) return { viewDistance: 10 };
-    const content = fs.readFileSync(PROPS_FILE, 'utf8');
-    const match = content.match(/view-distance=(\d+)/);
-    return { viewDistance: match ? parseInt(match[1]) : 10 };
-}
-
-// Update server.properties safely
-function updateProperties(key, value) {
+// Helper to update server.properties safely
+function updateProperties(updates) {
     let content = "";
     if (fs.existsSync(PROPS_FILE)) content = fs.readFileSync(PROPS_FILE, 'utf8');
     
-    // Ensure 25565 port
-    if(key === 'server-port') value = 25565;
+    // Always force port 25565
+    updates['server-port'] = 25565;
+    updates['query.port'] = 25565;
 
-    const regex = new RegExp(`^${key}=.*`, 'm');
-    if (content.match(regex)) {
-        content = content.replace(regex, `${key}=${value}`);
-    } else {
-        content += `\n${key}=${value}`;
+    for (const [key, value] of Object.entries(updates)) {
+        const regex = new RegExp(`^${key}=.*`, 'm');
+        if (content.match(regex)) {
+            content = content.replace(regex, `${key}=${value}`);
+        } else {
+            content += `\n${key}=${value}`;
+        }
     }
     fs.writeFileSync(PROPS_FILE, content);
 }
 
-// Force Port 25565
-function ensureNetworkProps() {
-    updateProperties('server-port', '25565');
-    updateProperties('query.port', '25565');
+function getProp(key, def) {
+    if (!fs.existsSync(PROPS_FILE)) return def;
+    const content = fs.readFileSync(PROPS_FILE, 'utf8');
+    const match = content.match(new RegExp(`${key}=(\\d+)`));
+    return match ? parseInt(match[1]) : def;
 }
+
+// --- MC LOGIC ---
+let mcProcess = null;
+let logs = [];
+let serverStatus = 'offline';
 
 async function downloadServerJar(version) {
     try {
@@ -124,106 +119,6 @@ async function downloadServerJar(version) {
     }
 }
 
-// --- EXPRESS ---
-app.use(express.static('public'));
-app.use(bodyParser.json());
-app.use(bodyParser.urlencoded({ extended: true }));
-app.use(session({ secret: 'secure-panel-secret', resave: false, saveUninitialized: true }));
-
-function checkAuth(req, res, next) {
-    if (req.session.loggedin) next();
-    else res.redirect('/login.html');
-}
-
-// --- ROUTES ---
-
-// Auth
-app.get('/api/check-setup', (req, res) => {
-    let users = fs.existsSync(USER_FILE) ? fs.readJsonSync(USER_FILE, { throws: false }) || {} : {};
-    res.json({ setupNeeded: Object.keys(users).length === 0 });
-});
-
-app.post('/api/auth', (req, res) => {
-    const { username, password, action } = req.body;
-    let users = fs.existsSync(USER_FILE) ? fs.readJsonSync(USER_FILE, { throws: false }) || {} : {};
-    if (action === 'signup') {
-        if (Object.keys(users).length > 0) return res.json({ success: false, msg: 'Admin exists.' });
-        users[username] = password;
-        fs.writeJsonSync(USER_FILE, users);
-        req.session.loggedin = true;
-        res.json({ success: true });
-    } else {
-        if (users[username] && users[username] === password) {
-            req.session.loggedin = true;
-            res.json({ success: true });
-        } else res.json({ success: false, msg: 'Invalid credentials' });
-    }
-});
-
-app.get('/api/logout', (req, res) => { req.session.destroy(); res.redirect('/login.html'); });
-
-// Dashboard
-app.get('/', checkAuth, (req, res) => { res.sendFile(path.join(__dirname, 'public/index.html')); });
-
-// Settings
-app.get('/api/settings', checkAuth, (req, res) => {
-    const cfg = getConfig();
-    const props = getProperties();
-    res.json({ ...cfg, viewDistance: props.viewDistance });
-});
-
-app.post('/api/settings', checkAuth, async (req, res) => {
-    const { ram, version, viewDistance } = req.body;
-    const oldConfig = getConfig();
-    
-    saveConfig({ ram, version });
-    updateProperties('view-distance', viewDistance);
-
-    if (version !== oldConfig.version) {
-        if (serverStatus !== 'offline') stopServer();
-        setTimeout(async () => {
-            try { await downloadServerJar(version); startServer(); } catch(e){}
-        }, 3000);
-    }
-    res.json({ success: true });
-});
-
-// World Management
-app.post('/api/world/upload', checkAuth, upload.single('file'), (req, res) => {
-    if (serverStatus !== 'offline') return res.status(400).send('Stop server first');
-    if (!req.file) return res.status(400).send('No file');
-    
-    try {
-        // Backup Logic could go here
-        fs.removeSync('world'); // Remove old world
-        const zip = new AdmZip(req.file.path);
-        zip.extractAllTo('.', true); // Extract to root (assumes zip contains 'world' folder or level.dat)
-        fs.unlinkSync(req.file.path);
-        res.redirect('/');
-    } catch(e) {
-        console.error(e);
-        res.status(500).send('Extraction failed');
-    }
-});
-
-// Plugins
-app.get('/api/plugins', checkAuth, (req, res) => {
-    fs.readdir(PLUGINS_DIR, (err, files) => {
-        if(err) return res.json([]);
-        res.json(files.filter(f => f.endsWith('.jar')));
-    });
-});
-
-app.post('/api/plugins/upload', checkAuth, upload.single('file'), (req, res) => {
-    if(req.file) fs.moveSync(req.file.path, path.join(PLUGINS_DIR, req.file.originalname), { overwrite: true });
-    res.redirect('/');
-});
-
-app.post('/api/plugins/delete', checkAuth, (req, res) => {
-    try { fs.removeSync(path.join(PLUGINS_DIR, req.body.filename)); res.json({ success: true }); } catch(e){ res.json({ success: false });}
-});
-
-// --- SERVER CONTROL ---
 function startServer() {
     if (mcProcess) return;
     const config = getConfig();
@@ -234,7 +129,7 @@ function startServer() {
         return;
     }
     
-    ensureNetworkProps();
+    updateProperties({}); // Enforces port 25565
 
     serverStatus = 'starting';
     io.emit('status', serverStatus);
@@ -269,10 +164,135 @@ function stopServer() {
     }
 }
 
-function sendCommand(cmd) {
-    if (mcProcess) mcProcess.stdin.write(cmd + '\n');
+// --- WEB APP ---
+app.use(express.static('public')); // Serves login.html, css, js
+app.use(bodyParser.json());
+app.use(session({ secret: 'secure-panel-secret', resave: false, saveUninitialized: false, cookie: { maxAge: 3600000 } }));
+
+// AUTH MIDDLEWARE
+function checkAuth(req, res, next) {
+    if (req.session.loggedin) {
+        next();
+    } else {
+        res.redirect('/login.html');
+    }
 }
 
+// ROUTES
+
+// 1. Dashboard (Protected)
+app.get('/', checkAuth, (req, res) => {
+    res.sendFile(path.join(__dirname, 'views', 'dashboard.html'));
+});
+
+// 2. Auth API
+app.get('/api/check-setup', (req, res) => {
+    let users = fs.existsSync(USER_FILE) ? fs.readJsonSync(USER_FILE, { throws: false }) || {} : {};
+    res.json({ setupNeeded: Object.keys(users).length === 0 });
+});
+
+app.post('/api/auth', (req, res) => {
+    const { username, password, action } = req.body;
+    let users = fs.existsSync(USER_FILE) ? fs.readJsonSync(USER_FILE, { throws: false }) || {} : {};
+
+    if (action === 'signup') {
+        if (Object.keys(users).length > 0) return res.json({ success: false, msg: 'Admin account already exists.' });
+        users[username] = password;
+        fs.writeJsonSync(USER_FILE, users);
+        req.session.loggedin = true;
+        res.json({ success: true });
+    } else {
+        if (users[username] && users[username] === password) {
+            req.session.loggedin = true;
+            res.json({ success: true });
+        } else {
+            res.json({ success: false, msg: 'Invalid credentials' });
+        }
+    }
+});
+
+app.get('/api/logout', (req, res) => {
+    req.session.destroy();
+    res.redirect('/login.html');
+});
+
+// 3. Settings API
+app.get('/api/settings', checkAuth, (req, res) => {
+    const cfg = getConfig();
+    res.json({ 
+        ram: cfg.ram, 
+        version: cfg.version, 
+        viewDistance: getProp('view-distance', 10) 
+    });
+});
+
+app.post('/api/settings', checkAuth, async (req, res) => {
+    try {
+        const { ram, version, viewDistance } = req.body;
+        const oldConfig = getConfig();
+        
+        console.log(`[Settings] Saving: RAM=${ram}, Ver=${version}, Dist=${viewDistance}`);
+        
+        // 1. Save Configs
+        saveConfig({ ram, version });
+        updateProperties({ 'view-distance': viewDistance });
+
+        // 2. Send Success Response BEFORE restarting
+        res.json({ success: true });
+
+        // 3. Handle Restart/Update Asynchronously
+        if (version !== oldConfig.version) {
+            console.log('[Settings] Version change detected. Restarting...');
+            if (serverStatus !== 'offline') stopServer();
+            
+            // Wait a bit for stop, then download and start
+            setTimeout(async () => {
+                try { 
+                    if(fs.existsSync('server.jar')) fs.unlinkSync('server.jar'); // Clear old jar
+                    await downloadServerJar(version); 
+                    startServer(); 
+                } catch(e) { console.error('Update failed', e); }
+            }, 5000);
+        } else {
+            // Just update props (render distance)
+             console.log('[Settings] Properties updated.');
+        }
+
+    } catch(e) {
+        console.error(e);
+        res.status(500).json({ success: false, msg: e.message });
+    }
+});
+
+// 4. File APIs
+app.post('/api/world/upload', checkAuth, upload.single('file'), (req, res) => {
+    if (serverStatus !== 'offline') return res.status(400).send('Stop server first');
+    try {
+        if (fs.existsSync('world')) fs.rmSync('world', { recursive: true, force: true });
+        const zip = new AdmZip(req.file.path);
+        zip.extractAllTo('.', true);
+        fs.unlinkSync(req.file.path);
+        res.redirect('/');
+    } catch(e) { res.status(500).send(e.message); }
+});
+
+app.get('/api/plugins', checkAuth, (req, res) => {
+    fs.readdir(PLUGINS_DIR, (err, files) => {
+        if(err) return res.json([]);
+        res.json(files.filter(f => f.endsWith('.jar')));
+    });
+});
+
+app.post('/api/plugins/upload', checkAuth, upload.single('file'), (req, res) => {
+    if(req.file) fs.moveSync(req.file.path, path.join(PLUGINS_DIR, req.file.originalname), { overwrite: true });
+    res.redirect('/');
+});
+
+app.post('/api/plugins/delete', checkAuth, (req, res) => {
+    try { fs.removeSync(path.join(PLUGINS_DIR, req.body.filename)); res.json({ success: true }); } catch(e){ res.json({ success: false });}
+});
+
+// --- SOCKET ---
 io.on('connection', (socket) => {
     socket.emit('history', logs.join(''));
     socket.emit('status', serverStatus);
@@ -280,23 +300,18 @@ io.on('connection', (socket) => {
         if (cmd === '__start__') startServer();
         else if (cmd === '__stop__') stopServer();
         else if (cmd === '__restart__') { stopServer(); setTimeout(startServer, 5000); }
-        else sendCommand(cmd);
+        else if (mcProcess) mcProcess.stdin.write(cmd + '\n');
     });
 });
 
-// Init
-const cfg = getConfig();
-if(!fs.existsSync('server.jar')) downloadServerJar(cfg.version);
-
-// Start Web Panel
+// Start
 const port = process.env.PANEL_PORT || 20000;
 server.listen(port, () => console.log(`Dashboard running on port ${port}`));
 EOF
 
-# --- 5. CREATE FRONTEND ---
-RUN mkdir public
+# --- 5. FRONTEND FILES ---
 
-# Login Page (Unchanged style but essential)
+# LOGIN (Public)
 RUN cat << 'EOF' > public/login.html
 <!DOCTYPE html>
 <html lang="en">
@@ -309,20 +324,32 @@ RUN cat << 'EOF' > public/login.html
     .card{background:#1e293b;padding:2rem;border-radius:12px;width:320px;text-align:center;border:1px solid #334155}
     input{width:100%;padding:12px;margin-bottom:10px;background:#334155;border:1px solid #475569;color:white;border-radius:6px;box-sizing:border-box}
     button{width:100%;padding:12px;background:#6366f1;color:white;border:none;border-radius:6px;cursor:pointer;font-weight:bold}
+    button:hover{background:#4f46e5}
 </style>
 </head>
 <body>
-<div class="card"><h2 id="title">Login</h2><form id="authForm"><input id="user" placeholder="Username" required><input type="password" id="pass" placeholder="Password" required><button type="submit">Access</button></form></div>
+<div class="card"><h2 id="title">Login</h2><form id="authForm"><input id="user" placeholder="Username" required><input type="password" id="pass" placeholder="Password" required><button type="submit">Access Panel</button></form></div>
 <script>
-    fetch('/api/check-setup').then(r=>r.json()).then(d=>{if(d.setupNeeded){document.getElementById('title').innerText='Setup Account';document.getElementById('authForm').dataset.action='signup'}});
-    document.getElementById('authForm').onsubmit=async(e)=>{e.preventDefault();const user=document.getElementById('user').value,pass=document.getElementById('pass').value,action=e.target.dataset.action||'login';const res=await fetch('/api/auth',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({username:user,password:pass,action})});const data=await res.json();if(data.success)location.href='/';else alert(data.msg)}
+    fetch('/api/check-setup').then(r=>r.json()).then(d=>{if(d.setupNeeded){document.getElementById('title').innerText='Create Admin';document.getElementById('authForm').dataset.action='signup'}});
+    document.getElementById('authForm').onsubmit=async(e)=>{
+        e.preventDefault();
+        const user=document.getElementById('user').value;
+        const pass=document.getElementById('pass').value;
+        const action=e.target.dataset.action||'login';
+        try {
+            const res=await fetch('/api/auth',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({username:user,password:pass,action})});
+            const data=await res.json();
+            if(data.success) location.reload(); // Reloads to root, which will serve dashboard
+            else alert(data.msg);
+        } catch(err) { alert('Connection Error'); }
+    }
 </script>
 </body>
 </html>
 EOF
 
-# Dashboard Page (Redesigned Compact Grid)
-RUN cat << 'EOF' > public/index.html
+# DASHBOARD (Protected - Moved to 'views' folder so it can't be accessed without login)
+RUN cat << 'EOF' > views/dashboard.html
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -339,7 +366,6 @@ RUN cat << 'EOF' > public/index.html
     * { box-sizing: border-box; }
     body { margin: 0; font-family: 'Segoe UI', system-ui, sans-serif; background: var(--bg); color: var(--text); height: 100vh; display: grid; grid-template-columns: 240px 1fr; overflow: hidden; }
     
-    /* Sidebar */
     .sidebar { background: var(--sidebar); padding: 20px; display: flex; flex-direction: column; border-right: 1px solid #334155; }
     .brand { font-size: 18px; font-weight: bold; color: var(--accent); margin-bottom: 30px; display: flex; align-items: center; gap: 10px; }
     .nav-btn { padding: 12px; margin-bottom: 5px; border-radius: 8px; cursor: pointer; color: var(--muted); transition: 0.2s; display: flex; align-items: center; gap: 12px; }
@@ -349,13 +375,10 @@ RUN cat << 'EOF' > public/index.html
     .s-online { background: var(--success); box-shadow: 0 0 8px var(--success); }
     .s-offline { background: var(--danger); box-shadow: 0 0 8px var(--danger); }
 
-    /* Main Area */
     .main { padding: 20px; overflow-y: auto; display: flex; flex-direction: column; gap: 20px; }
-    .header { display: flex; justify-content: space-between; align-items: center; }
     .page { display: none; flex-direction: column; gap: 15px; height: 100%; }
     .page.active { display: flex; }
 
-    /* Components */
     .card { background: var(--card); border: 1px solid #334155; border-radius: 8px; padding: 20px; }
     .grid-2 { display: grid; grid-template-columns: 1fr 1fr; gap: 15px; }
     .btn { padding: 8px 16px; border: none; border-radius: 6px; font-weight: 600; cursor: pointer; color: white; display: inline-flex; align-items: center; gap: 6px; transition: 0.2s; }
@@ -365,17 +388,13 @@ RUN cat << 'EOF' > public/index.html
     .btn-red { background: var(--danger); }
     .btn-gray { background: #334155; }
     
-    /* Terminal */
     .terminal-wrapper { flex: 1; display: flex; flex-direction: column; background: #0f0f10; border-radius: 8px; border: 1px solid #334155; max-height: 50vh; }
     #terminal { flex: 1; padding: 15px; overflow-y: auto; font-family: monospace; font-size: 13px; color: #cbd5e1; white-space: pre-wrap; }
     .input-bar { display: flex; padding: 10px; border-top: 1px solid #334155; background: #1e232e; }
     #cmdInput { flex: 1; background: transparent; border: none; color: white; outline: none; font-family: monospace; }
     
-    /* Forms */
     input[type="text"], input[type="number"], input[type="file"] { width: 100%; padding: 10px; background: #0f172a; border: 1px solid #334155; border-radius: 6px; color: white; }
     .control-row { display: flex; gap: 10px; margin-top: 10px; flex-wrap: wrap; }
-    
-    /* File List */
     .file-item { display: flex; justify-content: space-between; padding: 10px; border-bottom: 1px solid #334155; font-size: 14px; }
 </style>
 </head>
@@ -408,15 +427,12 @@ RUN cat << 'EOF' > public/index.html
                 <input id="cmdInput" placeholder="Enter command..." autocomplete="off">
             </div>
         </div>
-        
         <div class="grid-2">
             <div class="card">
                 <h3><i class="fas fa-clock"></i> Quick Time</h3>
                 <div class="control-row">
                     <button class="btn btn-gray" onclick="cmd('time set day')">☀ Day</button>
                     <button class="btn btn-gray" onclick="cmd('time set night')">🌙 Night</button>
-                    <button class="btn btn-gray" onclick="cmd('weather clear')">☁ Clear</button>
-                    <button class="btn btn-gray" onclick="cmd('weather rain')">🌧 Rain</button>
                 </div>
             </div>
             <div class="card">
@@ -424,7 +440,6 @@ RUN cat << 'EOF' > public/index.html
                 <div class="control-row">
                     <button class="btn btn-gray" onclick="cmd('gamemode survival @a')">Survival</button>
                     <button class="btn btn-gray" onclick="cmd('gamemode creative @a')">Creative</button>
-                    <button class="btn btn-gray" onclick="cmd('gamemode spectator @a')">Spectator</button>
                 </div>
             </div>
         </div>
@@ -437,12 +452,10 @@ RUN cat << 'EOF' > public/index.html
             <div style="display:flex; gap:10px; margin-bottom: 20px;">
                 <input id="targetPlayer" placeholder="Player Name">
                 <button class="btn btn-blue" onclick="pAction('op')">OP</button>
-                <button class="btn btn-blue" onclick="pAction('deop')">DeOP</button>
                 <button class="btn btn-red" onclick="pAction('kick')">Kick</button>
                 <button class="btn btn-red" onclick="pAction('ban')">Ban</button>
                 <button class="btn btn-green" onclick="pAction('pardon')">Unban</button>
             </div>
-            <p style="color:var(--muted); font-size:13px">Note: Execute these actions while server is online.</p>
         </div>
     </div>
 
@@ -450,7 +463,7 @@ RUN cat << 'EOF' > public/index.html
     <div id="worlds" class="page">
         <div class="card">
             <h3>Upload World (.zip)</h3>
-            <p style="color:#ef4444; font-size:13px; margin-bottom:15px"><i class="fas fa-exclamation-triangle"></i> DANGER: This will delete the current world! Stop the server first.</p>
+            <p style="color:#ef4444; font-size:13px; margin-bottom:15px">Warning: Overwrites current world. Stop server first.</p>
             <form action="/api/world/upload" method="POST" enctype="multipart/form-data" style="display:flex; gap:10px">
                 <input type="file" name="file" accept=".zip" required>
                 <button type="submit" class="btn btn-red">Upload & Replace</button>
@@ -478,25 +491,15 @@ RUN cat << 'EOF' > public/index.html
         <div class="card">
             <h3>Server Configuration</h3>
             <div class="control-row" style="flex-direction:column; gap:15px">
-                <div>
-                    <label>Allocated RAM (GB)</label>
-                    <input type="number" id="ramInput">
-                </div>
-                <div>
-                    <label>Minecraft Version (Paper)</label>
-                    <input type="text" id="verInput">
-                </div>
-                <div>
-                    <label>Render Distance (Chunks)</label>
-                    <input type="number" id="distInput">
-                </div>
+                <div><label>Allocated RAM (GB)</label><input type="number" id="ramInput"></div>
+                <div><label>Minecraft Version (Paper)</label><input type="text" id="verInput"></div>
+                <div><label>Render Distance</label><input type="number" id="distInput"></div>
                 <div style="text-align:right">
-                    <button class="btn btn-blue" onclick="saveSettings()">Save & Restart</button>
+                    <button class="btn btn-blue" id="saveBtn" onclick="saveSettings()">Save Configuration</button>
                 </div>
             </div>
         </div>
     </div>
-
 </div>
 
 <script src="/socket.io/socket.io.js"></script>
@@ -505,7 +508,6 @@ RUN cat << 'EOF' > public/index.html
     const term = document.getElementById('terminal');
     let autoScroll = true;
 
-    // Navigation
     function nav(id) {
         document.querySelectorAll('.page').forEach(p => p.classList.remove('active'));
         document.querySelectorAll('.nav-btn').forEach(b => b.classList.remove('active'));
@@ -515,7 +517,6 @@ RUN cat << 'EOF' > public/index.html
         if(id === 'settings') loadSettings();
     }
 
-    // Command Logic
     function cmd(c) { socket.emit('command', c); }
     function sys(c) { socket.emit('command', c); }
     
@@ -528,7 +529,6 @@ RUN cat << 'EOF' > public/index.html
         if(p) cmd(act + ' ' + p); else alert('Enter player name');
     }
 
-    // Socket Events
     socket.on('log', msg => {
         const d = document.createElement('div');
         d.textContent = msg;
@@ -537,9 +537,7 @@ RUN cat << 'EOF' > public/index.html
     });
     
     term.addEventListener('scroll', () => { autoScroll = (term.scrollTop + term.clientHeight >= term.scrollHeight - 20); });
-
     socket.on('history', h => { term.textContent = h; term.scrollTop = term.scrollHeight; });
-
     socket.on('status', s => {
         const el = document.getElementById('statusText');
         const dot = document.getElementById('statusDot');
@@ -547,7 +545,6 @@ RUN cat << 'EOF' > public/index.html
         dot.className = 'status-dot ' + (s === 'online' ? 's-online' : s === 'offline' ? 's-offline' : '');
     });
 
-    // Data Loaders
     function loadPlugins() {
         fetch('/api/plugins').then(r=>r.json()).then(d => {
             const l = document.getElementById('pluginList'); l.innerHTML='';
@@ -565,18 +562,32 @@ RUN cat << 'EOF' > public/index.html
         fetch('/api/settings').then(r=>r.json()).then(d => {
             document.getElementById('ramInput').value = d.ram;
             document.getElementById('verInput').value = d.version;
-            document.getElementById('distInput').value = d.viewDistance || 10;
+            document.getElementById('distInput').value = d.viewDistance;
         });
     }
 
     function saveSettings() {
+        const btn = document.getElementById('saveBtn');
+        btn.textContent = "Saving...";
+        btn.disabled = true;
+
         const data = {
             ram: document.getElementById('ramInput').value,
             version: document.getElementById('verInput').value,
             viewDistance: document.getElementById('distInput').value
         };
+
         fetch('/api/settings', {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(data)})
-        .then(r=>r.json()).then(d => { if(d.success) alert('Saved! Server restarting...'); });
+        .then(r=>r.json()).then(d => { 
+            btn.textContent = "Save Configuration";
+            btn.disabled = false;
+            if(d.success) alert('Settings Saved! If you changed the version, the server is restarting now.');
+            else alert('Error saving settings');
+        }).catch(e => {
+            btn.textContent = "Save Configuration";
+            btn.disabled = false;
+            alert('Connection Error');
+        });
     }
 </script>
 </body>
